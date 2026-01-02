@@ -7,7 +7,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2024-11-20.acacia',
+  apiVersion: '2024-11-20.acacia' as any,
 });
 
 const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
@@ -109,7 +109,7 @@ app.get('/v1/stripe/connect/accounts/:accountId', async (req, res) => {
       payoutsEnabled: account.payouts_enabled || false,
       detailsSubmitted: account.details_submitted || false,
       status: account.charges_enabled && account.payouts_enabled ? 'active' : account.requirements?.disabled_reason ? 'restricted' : 'pending',
-      createdAt: new Date(account.created * 1000).toISOString(),
+      createdAt: account.created ? new Date(account.created * 1000).toISOString() : new Date().toISOString(),
     };
     connectAccounts.set(accountId, accountData);
     res.json({ success: true, data: accountData });
