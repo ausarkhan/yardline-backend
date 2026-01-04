@@ -12,6 +12,14 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
 
 const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
+// Detect Stripe mode from the secret key
+const isTestMode = process.env.STRIPE_SECRET_KEY?.startsWith('sk_test_') || false;
+const isLiveMode = process.env.STRIPE_SECRET_KEY?.startsWith('sk_live_') || false;
+
+function getStripeMode(): 'test' | 'live' {
+  return isTestMode ? 'test' : 'live';
+}
+
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -35,6 +43,8 @@ interface ConnectAccount {
   detailsSubmitted: boolean;
   status: 'pending' | 'restricted' | 'active';
   createdAt: string;
+  testStripeAccountId?: string;
+  liveStripeAccountId?: string;
 }
 
 interface Ticket {
@@ -55,6 +65,54 @@ interface Ticket {
 const connectAccounts: Map<string, ConnectAccount> = new Map();
 const tickets: Map<string, Ticket[]> = new Map();
 
+// User records structure to track both test and live Stripe account IDs
+interface UserStripeAccounts {
+  userId: string;
+  testStripeAccountId?: string;
+  liveStripeAccountId?: string;
+}
+
+const userStripeAccounts: Map<string, UserStripeAccounts> = new Map();
+
+// Helper function to get or create the appropriate Stripe account ID based on mode
+async function getOrCreateStripeAccountId(userId: string, email: string, name: string): Promise<string> {
+  const mode = getStripeMode();
+  
+  // Get or initialize user's Stripe accounts
+  let userAccounts = userStripeAccounts.get(userId);
+  if (!userAccounts) {
+    userAccounts = { userId };
+    userStripeAccounts.set(userId, userAccounts);
+  }
+
+  // Check if we already have an account ID for this mode
+  const existingAccountId = mode === 'test' ? userAccounts.testStripeAccountId : userAccounts.liveStripeAccountId;
+  if (existingAccountId) {
+    return existingAccountId;
+  }
+
+  // Create a new Stripe Express account in the appropriate mode
+  const account = await stripe.accounts.create({
+    type: 'express',
+    email,
+    capabilities: {
+      card_payments: { requested: true },
+      transfers: { requested: true },
+    },
+    business_profile: { name },
+  });
+
+  // Store the account ID for this mode
+  if (mode === 'test') {
+    userAccounts.testStripeAccountId = account.id;
+  } else {
+    userAccounts.liveStripeAccountId = account.id;
+  }
+  userStripeAccounts.set(userId, userAccounts);
+
+  return account.id;
+}
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'yardline-api', version: '1.0.0' });
 });
@@ -63,26 +121,28 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
+app.get('/v1/stripe/mode', (req, res) => {
+  const mode = getStripeMode();
+  res.json({ success: true, data: { mode, isTestMode, isLiveMode } });
+});
+
 app.post('/v1/stripe/connect/accounts', async (req, res) => {
   try {
-    const { email, name, returnUrl, refreshUrl } = req.body;
-    const account = await stripe.accounts.create({
-      type: 'express',
-      email,
-      capabilities: {
-        card_payments: { requested: true },
-        transfers: { requested: true },
-      },
-      business_profile: { name },
-    });
+    const { email, name, returnUrl, refreshUrl, userId } = req.body;
+    
+    // Get or create the appropriate Stripe account for this mode and user
+    const accountId = await getOrCreateStripeAccountId(userId || 'default', email, name);
+    
     const accountLink = await stripe.accountLinks.create({
-      account: account.id,
+      account: accountId,
       refresh_url: refreshUrl || 'https://yardline.app/stripe/connect/refresh',
       return_url: returnUrl || 'https://yardline.app/stripe/connect/return',
       type: 'account_onboarding',
     });
-    connectAccounts.set(account.id, {
-      accountId: account.id,
+    
+    const mode = getStripeMode();
+    const accountData: ConnectAccount = {
+      accountId,
       email,
       name,
       chargesEnabled: false,
@@ -90,8 +150,17 @@ app.post('/v1/stripe/connect/accounts', async (req, res) => {
       detailsSubmitted: false,
       status: 'pending',
       createdAt: new Date().toISOString(),
-    });
-    res.json({ success: true, data: { accountId: account.id, onboardingUrl: accountLink.url } });
+    };
+    
+    // Store mode-specific account IDs
+    if (mode === 'test') {
+      accountData.testStripeAccountId = accountId;
+    } else {
+      accountData.liveStripeAccountId = accountId;
+    }
+    
+    connectAccounts.set(accountId, accountData);
+    res.json({ success: true, data: { accountId, onboardingUrl: accountLink.url, mode } });
   } catch (error) {
     res.status(500).json({ success: false, error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to create account' } });
   }
@@ -100,6 +169,7 @@ app.post('/v1/stripe/connect/accounts', async (req, res) => {
 app.get('/v1/stripe/connect/accounts/:accountId', async (req, res) => {
   try {
     const { accountId } = req.params;
+    const mode = getStripeMode();
     const account = await stripe.accounts.retrieve(accountId);
     const accountData: ConnectAccount = {
       accountId: account.id,
@@ -111,8 +181,16 @@ app.get('/v1/stripe/connect/accounts/:accountId', async (req, res) => {
       status: account.charges_enabled && account.payouts_enabled ? 'active' : account.requirements?.disabled_reason ? 'restricted' : 'pending',
       createdAt: account.created ? new Date(account.created * 1000).toISOString() : new Date().toISOString(),
     };
+    
+    // Include mode-specific account IDs
+    if (mode === 'test') {
+      accountData.testStripeAccountId = accountId;
+    } else {
+      accountData.liveStripeAccountId = accountId;
+    }
+    
     connectAccounts.set(accountId, accountData);
-    res.json({ success: true, data: accountData });
+    res.json({ success: true, data: accountData, mode });
   } catch (error) {
     res.status(500).json({ success: false, error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to get account' } });
   }
@@ -122,13 +200,14 @@ app.post('/v1/stripe/connect/accounts/:accountId/link', async (req, res) => {
   try {
     const { accountId } = req.params;
     const { returnUrl, refreshUrl } = req.body;
+    const mode = getStripeMode();
     const accountLink = await stripe.accountLinks.create({
       account: accountId,
       refresh_url: refreshUrl || 'https://yardline.app/stripe/connect/refresh',
       return_url: returnUrl || 'https://yardline.app/stripe/connect/return',
       type: 'account_onboarding',
     });
-    res.json({ success: true, data: { url: accountLink.url } });
+    res.json({ success: true, data: { url: accountLink.url }, mode });
   } catch (error) {
     res.status(500).json({ success: false, error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to create account link' } });
   }
