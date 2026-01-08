@@ -88,14 +88,6 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'stripe-signature'],
 }));
 
-app.use((req, res, next) => {
-  if (req.originalUrl === '/v1/stripe/webhooks') {
-    next();
-  } else {
-    express.json()(req, res, next);
-  }
-});
-
 interface ConnectAccount {
   accountId: string;
   email: string;
@@ -175,6 +167,111 @@ async function getOrCreateStripeAccountId(userId: string, email: string, name: s
 
   return account.id;
 }
+
+// Handler function for payment succeeded webhook events
+async function handlePaymentSucceeded(paymentIntent: Stripe.PaymentIntent) {
+  // Idempotency check - prevent duplicate ticket generation
+  if (processedPaymentIntents.has(paymentIntent.id)) {
+    console.log(`Payment ${paymentIntent.id} already processed, skipping`);
+    return;
+  }
+
+  const metadata = paymentIntent.metadata;
+  const itemsJson = metadata.items_json;
+  if (!itemsJson) return;
+  
+  try {
+    const items = JSON.parse(itemsJson) as Array<{ 
+      ticketTypeId: string; 
+      ticketTypeName: string; 
+      priceCents: number; 
+      quantity: number; 
+      platformFeeCents: number;
+      platformFeePerTicket?: number;
+    }>;
+    
+    const createdTickets: Ticket[] = [];
+    
+    for (const item of items) {
+      for (let i = 0; i < item.quantity; i++) {
+        const ticket: Ticket = {
+          ticketId: uuidv4(),
+          ticketNumber: `TKT-${Date.now()}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`,
+          qrToken: uuidv4(),
+          userId: metadata.user_id || 'unknown',
+          eventId: metadata.event_id || 'unknown',
+          ticketTypeId: item.ticketTypeId,
+          ticketTypeName: item.ticketTypeName,
+          priceCents: item.priceCents,
+          feesCents: item.platformFeePerTicket || Math.round(item.platformFeeCents / item.quantity),
+          paymentIntentId: paymentIntent.id,
+          status: 'confirmed',
+          createdAt: new Date().toISOString(),
+        };
+        createdTickets.push(ticket);
+      }
+    }
+    
+    tickets.set(paymentIntent.id, createdTickets);
+    
+    // Mark as processed for idempotency
+    processedPaymentIntents.add(paymentIntent.id);
+    
+    console.log(`Created ${createdTickets.length} tickets for payment ${paymentIntent.id}`);
+  } catch (error) {
+    console.error('Error creating tickets:', error);
+  }
+}
+
+// Stripe webhook route MUST be defined BEFORE express.json() middleware
+// Uses raw body parsing for signature verification
+app.post('/v1/stripe/webhooks', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'] as string;
+  let event: Stripe.Event;
+  const webhookSecret = getWebhookSecret();
+  
+  try {
+    if (webhookSecret) {
+      // Verify signature with environment-specific webhook secret
+      event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+      console.log(`Webhook verified for ${getStripeMode()} mode: ${(event as any).type}`);
+    } else {
+      // Development mode - no signature verification (not recommended for production)
+      event = JSON.parse(req.body.toString());
+      console.warn('⚠️  Webhook signature verification disabled - set STRIPE_WEBHOOK_SECRET');
+    }
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err instanceof Error ? err.message : err);
+    return res.status(400).send('Webhook signature verification failed');
+  }
+  try {
+    switch (event.type) {
+      case 'payment_intent.succeeded':
+        await handlePaymentSucceeded(event.data.object as Stripe.PaymentIntent);
+        break;
+      case 'payment_intent.payment_failed':
+        console.log('Payment failed:', (event.data.object as Stripe.PaymentIntent).id);
+        break;
+      case 'account.updated':
+        const account = event.data.object as Stripe.Account;
+        const existing = connectAccounts.get(account.id);
+        if (existing) {
+          existing.chargesEnabled = account.charges_enabled || false;
+          existing.payoutsEnabled = account.payouts_enabled || false;
+          existing.detailsSubmitted = account.details_submitted || false;
+          existing.status = account.charges_enabled && account.payouts_enabled ? 'active' : 'pending';
+          connectAccounts.set(account.id, existing);
+        }
+        break;
+    }
+    res.json({ received: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Webhook handler failed' });
+  }
+});
+
+// Apply JSON body parsing to all other routes
+app.use(express.json());
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'yardline-api', version: '1.0.0' });
@@ -533,105 +630,6 @@ app.get('/v1/tickets/by-payment/:paymentIntentId', (req, res) => {
   const paymentTickets = tickets.get(paymentIntentId) || [];
   res.json({ success: true, data: paymentTickets });
 });
-
-app.post('/v1/stripe/webhooks', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'] as string;
-  let event: Stripe.Event;
-  const webhookSecret = getWebhookSecret();
-  
-  try {
-    if (webhookSecret) {
-      // Verify signature with environment-specific webhook secret
-      event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-      console.log(`Webhook verified for ${getStripeMode()} mode: ${(event as any).type}`);
-    } else {
-      // Development mode - no signature verification (not recommended for production)
-      event = JSON.parse(req.body.toString());
-      console.warn('⚠️  Webhook signature verification disabled - set STRIPE_WEBHOOK_SECRET');
-    }
-  } catch (err) {
-    console.error('Webhook signature verification failed:', err instanceof Error ? err.message : err);
-    return res.status(400).send('Webhook signature verification failed');
-  }
-  try {
-    switch (event.type) {
-      case 'payment_intent.succeeded':
-        await handlePaymentSucceeded(event.data.object as Stripe.PaymentIntent);
-        break;
-      case 'payment_intent.payment_failed':
-        console.log('Payment failed:', (event.data.object as Stripe.PaymentIntent).id);
-        break;
-      case 'account.updated':
-        const account = event.data.object as Stripe.Account;
-        const existing = connectAccounts.get(account.id);
-        if (existing) {
-          existing.chargesEnabled = account.charges_enabled || false;
-          existing.payoutsEnabled = account.payouts_enabled || false;
-          existing.detailsSubmitted = account.details_submitted || false;
-          existing.status = account.charges_enabled && account.payouts_enabled ? 'active' : 'pending';
-          connectAccounts.set(account.id, existing);
-        }
-        break;
-    }
-    res.json({ received: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Webhook handler failed' });
-  }
-});
-
-async function handlePaymentSucceeded(paymentIntent: Stripe.PaymentIntent) {
-  // Idempotency check - prevent duplicate ticket generation
-  if (processedPaymentIntents.has(paymentIntent.id)) {
-    console.log(`Payment ${paymentIntent.id} already processed, skipping`);
-    return;
-  }
-
-  const metadata = paymentIntent.metadata;
-  const itemsJson = metadata.items_json;
-  if (!itemsJson) return;
-  
-  try {
-    const items = JSON.parse(itemsJson) as Array<{ 
-      ticketTypeId: string; 
-      ticketTypeName: string; 
-      priceCents: number; 
-      quantity: number; 
-      platformFeeCents: number;
-      platformFeePerTicket?: number;
-    }>;
-    
-    const createdTickets: Ticket[] = [];
-    
-    for (const item of items) {
-      for (let i = 0; i < item.quantity; i++) {
-        const ticket: Ticket = {
-          ticketId: uuidv4(),
-          ticketNumber: `TKT-${Date.now()}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`,
-          qrToken: uuidv4(),
-          userId: metadata.user_id || 'unknown',
-          eventId: metadata.event_id || 'unknown',
-          ticketTypeId: item.ticketTypeId,
-          ticketTypeName: item.ticketTypeName,
-          priceCents: item.priceCents,
-          feesCents: item.platformFeePerTicket || Math.round(item.platformFeeCents / item.quantity),
-          paymentIntentId: paymentIntent.id,
-          status: 'confirmed',
-          createdAt: new Date().toISOString(),
-        };
-        createdTickets.push(ticket);
-      }
-    }
-    
-    tickets.set(paymentIntent.id, createdTickets);
-    
-    // Mark as processed for idempotency
-    processedPaymentIntents.add(paymentIntent.id);
-    
-    console.log(`Created ${createdTickets.length} tickets for payment ${paymentIntent.id}`);
-  } catch (error) {
-    console.error('Error creating tickets:', error);
-  }
-}
 
 app.listen(PORT, () => {
   console.log(`YardLine API running on port ${PORT}`);
