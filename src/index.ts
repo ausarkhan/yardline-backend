@@ -6,18 +6,80 @@ import { v4 as uuidv4 } from 'uuid';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+// Environment-based Stripe configuration
+// Supports two modes:
+// 1. Explicit environment selection via STRIPE_ENV (test/live)
+// 2. Legacy: Auto-detect from STRIPE_SECRET_KEY prefix
+const STRIPE_ENV = process.env.STRIPE_ENV as 'test' | 'live' | undefined;
+
+// Environment-specific keys
+const STRIPE_TEST_SECRET_KEY = process.env.STRIPE_TEST_SECRET_KEY;
+const STRIPE_LIVE_SECRET_KEY = process.env.STRIPE_LIVE_SECRET_KEY;
+const STRIPE_TEST_WEBHOOK_SECRET = process.env.STRIPE_TEST_WEBHOOK_SECRET;
+const STRIPE_LIVE_WEBHOOK_SECRET = process.env.STRIPE_LIVE_WEBHOOK_SECRET;
+
+// Legacy single key support (backward compatible)
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+
+// Determine which Stripe key to use
+function getStripeSecretKey(): string {
+  if (STRIPE_ENV) {
+    // Explicit environment mode
+    const key = STRIPE_ENV === 'test' ? STRIPE_TEST_SECRET_KEY : STRIPE_LIVE_SECRET_KEY;
+    if (!key) {
+      throw new Error(`STRIPE_ENV is set to "${STRIPE_ENV}" but STRIPE_${STRIPE_ENV.toUpperCase()}_SECRET_KEY is not configured`);
+    }
+    return key;
+  } else if (STRIPE_SECRET_KEY) {
+    // Legacy mode - single key
+    return STRIPE_SECRET_KEY;
+  } else {
+    throw new Error('No Stripe secret key configured. Set STRIPE_ENV + STRIPE_TEST_SECRET_KEY/STRIPE_LIVE_SECRET_KEY, or STRIPE_SECRET_KEY');
+  }
+}
+
+// Determine which webhook secret to use
+function getWebhookSecret(): string | undefined {
+  if (STRIPE_ENV) {
+    // Explicit environment mode
+    return STRIPE_ENV === 'test' ? STRIPE_TEST_WEBHOOK_SECRET : STRIPE_LIVE_WEBHOOK_SECRET;
+  } else {
+    // Legacy mode
+    return STRIPE_WEBHOOK_SECRET;
+  }
+}
+
+// Detect Stripe mode
+function getStripeMode(): 'test' | 'live' {
+  if (STRIPE_ENV) {
+    return STRIPE_ENV;
+  }
+  // Legacy: auto-detect from key prefix
+  const key = STRIPE_SECRET_KEY;
+  if (key?.startsWith('sk_test_')) return 'test';
+  if (key?.startsWith('sk_live_')) return 'live';
+  return 'test'; // default to test mode
+}
+
+const isTestMode = getStripeMode() === 'test';
+const isLiveMode = getStripeMode() === 'live';
+
+// Initialize Stripe with the appropriate key
+const stripe = new Stripe(getStripeSecretKey(), {
   apiVersion: '2024-11-20.acacia' as any,
 });
 
-const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+// Review-safe mode - prevents real charges during App Store review
+const REVIEW_MODE = process.env.REVIEW_MODE === 'true';
+const REVIEW_MODE_MAX_CHARGE_CENTS = 100; // $1.00 max in review mode
 
-// Detect Stripe mode from the secret key
-const isTestMode = process.env.STRIPE_SECRET_KEY?.startsWith('sk_test_') || false;
-const isLiveMode = process.env.STRIPE_SECRET_KEY?.startsWith('sk_live_') || false;
-
-function getStripeMode(): 'test' | 'live' {
-  return isTestMode ? 'test' : 'live';
+// Calculate platform fee per ticket using the exact formula
+// Formula: max(0.99, min(8% of item price AFTER discount, 12.99))
+function calculatePlatformFeePerTicket(ticketPriceCents: number): number {
+  const eightPercent = Math.round(ticketPriceCents * 0.08);
+  const feeCents = Math.max(99, Math.min(eightPercent, 1299));
+  return feeCents;
 }
 
 app.use(cors({
@@ -64,6 +126,7 @@ interface Ticket {
 
 const connectAccounts: Map<string, ConnectAccount> = new Map();
 const tickets: Map<string, Ticket[]> = new Map();
+const processedPaymentIntents: Set<string> = new Set(); // Idempotency tracking for webhook processing
 
 // User records structure to track both test and live Stripe account IDs
 interface UserStripeAccounts {
@@ -123,7 +186,19 @@ app.get('/health', (req, res) => {
 
 app.get('/v1/stripe/mode', (req, res) => {
   const mode = getStripeMode();
-  res.json({ success: true, data: { mode, isTestMode, isLiveMode } });
+  res.json({ 
+    success: true, 
+    data: { 
+      mode, 
+      isTestMode, 
+      isLiveMode,
+      reviewMode: REVIEW_MODE,
+      reviewModeMaxChargeCents: REVIEW_MODE ? REVIEW_MODE_MAX_CHARGE_CENTS : null,
+      envConfigured: !!STRIPE_ENV,
+      stripeEnv: STRIPE_ENV || 'auto-detect',
+      webhookConfigured: !!getWebhookSecret()
+    } 
+  });
 });
 
 app.post('/v1/stripe/connect/accounts', async (req, res) => {
@@ -213,6 +288,188 @@ app.post('/v1/stripe/connect/accounts/:accountId/link', async (req, res) => {
   }
 });
 
+// POST /v1/payments/create-intent - PaymentSheet-compatible endpoint
+// This endpoint calculates all amounts server-side and supports saved payment methods
+app.post('/v1/payments/create-intent', async (req, res) => {
+  try {
+    const { 
+      userId, 
+      eventId, 
+      items, // Array of { ticketTypeId, ticketTypeName, priceCents, quantity }
+      connectedAccountId,
+      description,
+      customerEmail,
+      customerName
+    } = req.body;
+
+    // Validate required fields
+    if (!userId || !eventId || !items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: { 
+          type: 'invalid_request_error', 
+          message: 'Missing required fields: userId, eventId, and items are required' 
+        } 
+      });
+    }
+
+    // Calculate totals server-side
+    let ticketSubtotalCents = 0;
+    let platformFeeTotalCents = 0;
+
+    const itemsWithFees = items.map((item: any) => {
+      const { ticketTypeId, ticketTypeName, priceCents, quantity } = item;
+      
+      if (!ticketTypeId || !ticketTypeName || typeof priceCents !== 'number' || typeof quantity !== 'number') {
+        throw new Error('Invalid item format');
+      }
+
+      // Calculate platform fee per ticket using the formula
+      const platformFeePerTicket = calculatePlatformFeePerTicket(priceCents);
+      const platformFeeCents = platformFeePerTicket * quantity;
+
+      ticketSubtotalCents += priceCents * quantity;
+      platformFeeTotalCents += platformFeeCents;
+
+      return {
+        ticketTypeId,
+        ticketTypeName,
+        priceCents,
+        quantity,
+        platformFeeCents,
+        platformFeePerTicket
+      };
+    });
+
+    const totalChargeCents = ticketSubtotalCents + platformFeeTotalCents;
+
+    // Review mode guardrail - prevent large charges during App Store review
+    if (REVIEW_MODE && totalChargeCents > REVIEW_MODE_MAX_CHARGE_CENTS) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: 'review_mode_error',
+          message: `Review mode is enabled. Maximum charge is $${REVIEW_MODE_MAX_CHARGE_CENTS / 100}. Requested: $${totalChargeCents / 100}`,
+          code: 'review_mode_limit_exceeded'
+        }
+      });
+    }
+
+    // Minimum charge validation
+    if (totalChargeCents < 50) {
+      return res.status(400).json({ 
+        success: false, 
+        error: { 
+          type: 'invalid_request_error', 
+          message: 'Amount must be at least $0.50 USD', 
+          code: 'amount_too_small' 
+        } 
+      });
+    }
+
+    // Create or retrieve Stripe Customer (required for PaymentSheet with saved methods)
+    let customerId: string | undefined;
+    let ephemeralKeySecret: string | undefined;
+
+    if (customerEmail) {
+      // Check if customer already exists
+      const customers = await stripe.customers.list({
+        email: customerEmail,
+        limit: 1
+      });
+
+      if (customers.data.length > 0) {
+        customerId = customers.data[0].id;
+      } else {
+        // Create new customer
+        const customer = await stripe.customers.create({
+          email: customerEmail,
+          name: customerName,
+          metadata: { userId }
+        });
+        customerId = customer.id;
+      }
+
+      // Generate ephemeral key for PaymentSheet
+      const ephemeralKey = await stripe.ephemeralKeys.create(
+        { customer: customerId },
+        { apiVersion: '2024-11-20.acacia' as any }
+      );
+      ephemeralKeySecret = ephemeralKey.secret;
+    }
+
+    // Create PaymentIntent
+    const paymentIntentParams: Stripe.PaymentIntentCreateParams = {
+      amount: totalChargeCents,
+      currency: 'usd',
+      description: description || `YardLine Event Tickets - ${eventId}`,
+      metadata: {
+        user_id: userId,
+        event_id: eventId,
+        items_json: JSON.stringify(itemsWithFees),
+        ticket_subtotal_cents: String(ticketSubtotalCents),
+        platform_fee_total_cents: String(platformFeeTotalCents),
+        total_charge_cents: String(totalChargeCents),
+        review_mode: String(REVIEW_MODE)
+      },
+      automatic_payment_methods: { 
+        enabled: true,
+        allow_redirects: 'never' // Important for in-app payment sheet
+      }
+    };
+
+    // Add customer if provided
+    if (customerId) {
+      paymentIntentParams.customer = customerId;
+    }
+
+    // Configure Connect transfer if selling on behalf of connected account
+    if (connectedAccountId) {
+      paymentIntentParams.transfer_data = { 
+        destination: connectedAccountId 
+      };
+      paymentIntentParams.application_fee_amount = platformFeeTotalCents;
+      paymentIntentParams.metadata!.connected_account = connectedAccountId;
+    }
+
+    // Create payment intent with auto-generated idempotency key
+    const idempotencyKey = `payment_${userId}_${eventId}_${Date.now()}`;
+    const paymentIntent = await stripe.paymentIntents.create(
+      paymentIntentParams, 
+      { idempotencyKey }
+    );
+
+    // Return PaymentSheet-compatible response
+    res.json({ 
+      success: true, 
+      data: {
+        paymentIntentClientSecret: paymentIntent.client_secret,
+        paymentIntentId: paymentIntent.id,
+        customerId,
+        ephemeralKey: ephemeralKeySecret,
+        publishableKey: process.env.STRIPE_PUBLISHABLE_KEY,
+        amount: totalChargeCents,
+        currency: 'usd',
+        ticketSubtotalCents,
+        platformFeeTotalCents,
+        itemsWithFees,
+        mode: getStripeMode(),
+        reviewMode: REVIEW_MODE
+      }
+    });
+  } catch (error) {
+    console.error('Error creating payment intent:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: { 
+        type: 'api_error', 
+        message: error instanceof Error ? error.message : 'Failed to create payment intent' 
+      } 
+    });
+  }
+});
+
+// Legacy endpoint - kept for backward compatibility but calculates fees server-side now
 app.post('/v1/stripe/payment-intents', async (req, res) => {
   try {
     const { connectedAccountId, items, ticketSubtotalCents, platformFeeTotalCents, totalChargeCents, description, metadata, idempotencyKey } = req.body;
@@ -280,13 +537,20 @@ app.get('/v1/tickets/by-payment/:paymentIntentId', (req, res) => {
 app.post('/v1/stripe/webhooks', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'] as string;
   let event: Stripe.Event;
+  const webhookSecret = getWebhookSecret();
+  
   try {
-    if (WEBHOOK_SECRET) {
-      event = stripe.webhooks.constructEvent(req.body, sig, WEBHOOK_SECRET);
+    if (webhookSecret) {
+      // Verify signature with environment-specific webhook secret
+      event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+      console.log(`Webhook verified for ${getStripeMode()} mode: ${(event as any).type}`);
     } else {
+      // Development mode - no signature verification (not recommended for production)
       event = JSON.parse(req.body.toString());
+      console.warn('⚠️  Webhook signature verification disabled - set STRIPE_WEBHOOK_SECRET');
     }
   } catch (err) {
+    console.error('Webhook signature verification failed:', err instanceof Error ? err.message : err);
     return res.status(400).send('Webhook signature verification failed');
   }
   try {
@@ -316,12 +580,28 @@ app.post('/v1/stripe/webhooks', express.raw({ type: 'application/json' }), async
 });
 
 async function handlePaymentSucceeded(paymentIntent: Stripe.PaymentIntent) {
+  // Idempotency check - prevent duplicate ticket generation
+  if (processedPaymentIntents.has(paymentIntent.id)) {
+    console.log(`Payment ${paymentIntent.id} already processed, skipping`);
+    return;
+  }
+
   const metadata = paymentIntent.metadata;
   const itemsJson = metadata.items_json;
   if (!itemsJson) return;
+  
   try {
-    const items = JSON.parse(itemsJson) as Array<{ ticketTypeId: string; ticketTypeName: string; priceCents: number; quantity: number; platformFeeCents: number }>;
+    const items = JSON.parse(itemsJson) as Array<{ 
+      ticketTypeId: string; 
+      ticketTypeName: string; 
+      priceCents: number; 
+      quantity: number; 
+      platformFeeCents: number;
+      platformFeePerTicket?: number;
+    }>;
+    
     const createdTickets: Ticket[] = [];
+    
     for (const item of items) {
       for (let i = 0; i < item.quantity; i++) {
         const ticket: Ticket = {
@@ -333,7 +613,7 @@ async function handlePaymentSucceeded(paymentIntent: Stripe.PaymentIntent) {
           ticketTypeId: item.ticketTypeId,
           ticketTypeName: item.ticketTypeName,
           priceCents: item.priceCents,
-          feesCents: Math.round(item.platformFeeCents / item.quantity),
+          feesCents: item.platformFeePerTicket || Math.round(item.platformFeeCents / item.quantity),
           paymentIntentId: paymentIntent.id,
           status: 'confirmed',
           createdAt: new Date().toISOString(),
@@ -341,7 +621,13 @@ async function handlePaymentSucceeded(paymentIntent: Stripe.PaymentIntent) {
         createdTickets.push(ticket);
       }
     }
+    
     tickets.set(paymentIntent.id, createdTickets);
+    
+    // Mark as processed for idempotency
+    processedPaymentIntents.add(paymentIntent.id);
+    
+    console.log(`Created ${createdTickets.length} tickets for payment ${paymentIntent.id}`);
   } catch (error) {
     console.error('Error creating tickets:', error);
   }
