@@ -223,52 +223,124 @@ async function handlePaymentSucceeded(paymentIntent: Stripe.PaymentIntent) {
   }
 }
 
-// Stripe webhook route MUST be defined BEFORE express.json() middleware
-// Uses raw body parsing for signature verification
-app.post('/v1/stripe/webhooks', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'] as string;
-  let event: Stripe.Event;
-  const webhookSecret = getWebhookSecret();
-  
-  try {
-    if (webhookSecret) {
-      // Verify signature with environment-specific webhook secret
-      event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-      console.log(`Webhook verified for ${getStripeMode()} mode: ${(event as any).type}`);
-    } else {
-      // Development mode - no signature verification (not recommended for production)
-      event = JSON.parse(req.body.toString());
-      console.warn('⚠️  Webhook signature verification disabled - set STRIPE_WEBHOOK_SECRET');
+// ============================================================================
+// STRIPE WEBHOOK ENDPOINT - CRITICAL: Must be defined BEFORE express.json()
+// ============================================================================
+// This endpoint uses express.raw() to preserve the raw request body needed
+// for Stripe signature verification. Follows Stripe's official Express pattern.
+// Route: /v1/stripe/webhooks (must match Stripe Dashboard configuration exactly)
+// ============================================================================
+app.post(
+  '/v1/stripe/webhooks',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    // Get the Stripe signature header
+    const signature = req.headers['stripe-signature'];
+    const webhookSecret = getWebhookSecret();
+
+    // Debug logging for production troubleshooting
+    console.log('=== Stripe Webhook Received ===');
+    console.log('Timestamp:', new Date().toISOString());
+    console.log('Stripe-Signature header present:', !!signature);
+    console.log('Webhook secret configured:', !!webhookSecret);
+    console.log('Request body type:', typeof req.body);
+    console.log('Request body is Buffer:', Buffer.isBuffer(req.body));
+    console.log('Content-Type:', req.headers['content-type']);
+
+    // Validate signature header exists
+    if (!signature) {
+      console.error('❌ Webhook Error: No stripe-signature header found');
+      console.error('Available headers:', Object.keys(req.headers));
+      return res.status(400).send('Error: No stripe-signature header found');
     }
-  } catch (err) {
-    console.error('Webhook signature verification failed:', err instanceof Error ? err.message : err);
-    return res.status(400).send('Webhook signature verification failed');
-  }
-  try {
-    switch (event.type) {
-      case 'payment_intent.succeeded':
-        await handlePaymentSucceeded(event.data.object as Stripe.PaymentIntent);
-        break;
-      case 'payment_intent.payment_failed':
-        console.log('Payment failed:', (event.data.object as Stripe.PaymentIntent).id);
-        break;
-      case 'account.updated':
-        const account = event.data.object as Stripe.Account;
-        const existing = connectAccounts.get(account.id);
-        if (existing) {
-          existing.chargesEnabled = account.charges_enabled || false;
-          existing.payoutsEnabled = account.payouts_enabled || false;
-          existing.detailsSubmitted = account.details_submitted || false;
-          existing.status = account.charges_enabled && account.payouts_enabled ? 'active' : 'pending';
-          connectAccounts.set(account.id, existing);
-        }
-        break;
+
+    // Validate webhook secret is configured
+    if (!webhookSecret) {
+      console.error('❌ Webhook Error: No webhook secret configured');
+      console.error('Set STRIPE_WEBHOOK_SECRET or environment-specific secrets');
+      return res.status(500).send('Error: Webhook secret not configured');
     }
-    res.json({ received: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Webhook handler failed' });
+
+    let event: Stripe.Event;
+
+    // Verify the webhook signature
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        webhookSecret
+      );
+      console.log('✅ Webhook signature verified successfully');
+      console.log('Event type:', event.type);
+      console.log('Event ID:', event.id);
+      console.log('Mode:', getStripeMode());
+    } catch (err) {
+      // Signature verification failed - log detailed error
+      console.error('❌ Webhook signature verification failed');
+      console.error('Error:', err instanceof Error ? err.message : String(err));
+      console.error('Signature header:', signature);
+      console.error('Body length:', req.body?.length);
+      console.error('Webhook secret (first 10 chars):', webhookSecret.substring(0, 10) + '...');
+      
+      return res.status(400).send(`Webhook Error: ${err instanceof Error ? err.message : 'Signature verification failed'}`);
+    }
+
+    // Handle the verified event
+    try {
+      console.log(`Processing event: ${event.type}`);
+      
+      switch (event.type) {
+        case 'payment_intent.succeeded':
+          const paymentIntent = event.data.object as Stripe.PaymentIntent;
+          console.log(`💰 Payment succeeded: ${paymentIntent.id} - Amount: ${paymentIntent.amount}`);
+          await handlePaymentSucceeded(paymentIntent);
+          break;
+
+        case 'payment_intent.payment_failed':
+          const failedPayment = event.data.object as Stripe.PaymentIntent;
+          console.log(`❌ Payment failed: ${failedPayment.id}`);
+          // Handle payment failure logic here if needed
+          break;
+
+        case 'account.updated':
+          const account = event.data.object as Stripe.Account;
+          console.log(`🔄 Account updated: ${account.id}`);
+          const existing = connectAccounts.get(account.id);
+          if (existing) {
+            existing.chargesEnabled = account.charges_enabled || false;
+            existing.payoutsEnabled = account.payouts_enabled || false;
+            existing.detailsSubmitted = account.details_submitted || false;
+            existing.status = account.charges_enabled && account.payouts_enabled ? 'active' : 'pending';
+            connectAccounts.set(account.id, existing);
+            console.log(`Account ${account.id} status: ${existing.status}`);
+          }
+          break;
+
+        default:
+          console.log(`ℹ️  Unhandled event type: ${event.type}`);
+      }
+
+      // Return 200 to acknowledge receipt of the event
+      console.log('✅ Webhook processed successfully');
+      return res.json({ received: true, eventId: event.id });
+      
+    } catch (error) {
+      // Event processing failed - log but still return 200 to prevent retries
+      console.error('❌ Error processing webhook event:');
+      console.error('Event type:', event.type);
+      console.error('Event ID:', event.id);
+      console.error('Error:', error instanceof Error ? error.message : String(error));
+      console.error('Stack:', error instanceof Error ? error.stack : 'N/A');
+      
+      // Return 200 to prevent Stripe from retrying (event was received and verified)
+      return res.status(200).json({ 
+        received: true, 
+        error: 'Event processing failed',
+        eventId: event.id 
+      });
+    }
   }
-});
+);
 
 // Apply JSON body parsing to all other routes
 app.use(express.json());
