@@ -208,6 +208,88 @@ async function getOrCreateStripeAccountId(userId: string, email: string, name: s
   return account.id;
 }
 
+// Handler function for checkout session completed webhook events
+async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) {
+  console.log(`Processing checkout session: ${session.id}`);
+  console.log(`Payment status: ${session.payment_status}`);
+  
+  // CRITICAL: Only create tickets if payment is confirmed
+  if (session.payment_status !== 'paid') {
+    console.log(`⚠️  Checkout session ${session.id} not paid yet (status: ${session.payment_status}), skipping ticket creation`);
+    return;
+  }
+
+  // Idempotency check - prevent duplicate ticket generation
+  const sessionIdempotencyKey = `checkout_${session.id}`;
+  if (processedPaymentIntents.has(sessionIdempotencyKey)) {
+    console.log(`Checkout session ${session.id} already processed, skipping`);
+    return;
+  }
+
+  // Get the PaymentIntent to access metadata
+  const paymentIntentId = session.payment_intent as string;
+  if (!paymentIntentId) {
+    console.error(`No payment intent found for checkout session ${session.id}`);
+    return;
+  }
+
+  try {
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+    const metadata = paymentIntent.metadata;
+    const itemsJson = metadata.items_json;
+    
+    if (!itemsJson) {
+      console.error(`No items_json in metadata for payment intent ${paymentIntentId}`);
+      return;
+    }
+    
+    const items = JSON.parse(itemsJson) as Array<{ 
+      ticketTypeId: string; 
+      ticketTypeName: string; 
+      priceCents: number; 
+      quantity: number; 
+      buyerFeeCents?: number;
+      buyerFeePerTicket?: number;
+      platformFeeCents?: number;
+      platformFeePerTicket?: number;
+    }>;
+    
+    const createdTickets: Ticket[] = [];
+    
+    for (const item of items) {
+      for (let i = 0; i < item.quantity; i++) {
+        const ticket: Ticket = {
+          ticketId: uuidv4(),
+          ticketNumber: `TKT-${Date.now()}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`,
+          qrToken: uuidv4(),
+          userId: metadata.user_id || 'unknown',
+          eventId: metadata.event_id || 'unknown',
+          ticketTypeId: item.ticketTypeId,
+          ticketTypeName: item.ticketTypeName,
+          priceCents: item.priceCents,
+          feesCents: item.buyerFeePerTicket || item.platformFeePerTicket || Math.round((item.buyerFeeCents || item.platformFeeCents || 0) / item.quantity),
+          paymentIntentId: paymentIntentId,
+          status: 'confirmed',
+          createdAt: new Date().toISOString(),
+        };
+        createdTickets.push(ticket);
+      }
+    }
+    
+    // Store tickets with both checkout session ID and payment intent ID
+    tickets.set(paymentIntentId, createdTickets);
+    tickets.set(session.id, createdTickets);
+    
+    // Mark as processed for idempotency
+    processedPaymentIntents.add(sessionIdempotencyKey);
+    processedPaymentIntents.add(paymentIntentId);
+    
+    console.log(`✅ Created ${createdTickets.length} tickets for checkout session ${session.id}`);
+  } catch (error) {
+    console.error('Error creating tickets from checkout session:', error);
+  }
+}
+
 // Handler function for payment succeeded webhook events
 async function handlePaymentSucceeded(paymentIntent: Stripe.PaymentIntent) {
   // Idempotency check - prevent duplicate ticket generation
@@ -333,6 +415,12 @@ app.post(
       console.log(`Processing event: ${event.type}`);
       
       switch (event.type) {
+        case 'checkout.session.completed':
+          const session = event.data.object as Stripe.Checkout.Session;
+          console.log(`🛒 Checkout session completed: ${session.id}`);
+          await handleCheckoutSessionCompleted(session);
+          break;
+
         case 'payment_intent.succeeded':
           const paymentIntent = event.data.object as Stripe.PaymentIntent;
           console.log(`💰 Payment succeeded: ${paymentIntent.id} - Amount: ${paymentIntent.amount}`);
@@ -497,6 +585,224 @@ app.post('/v1/stripe/connect/accounts/:accountId/link', async (req, res) => {
     res.json({ success: true, data: { url: accountLink.url }, mode });
   } catch (error) {
     res.status(500).json({ success: false, error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to create account link' } });
+  }
+});
+
+// POST /v1/checkout/create-session - Create Stripe Checkout Session with Model A pricing
+// This endpoint uses Checkout Sessions for a hosted payment experience
+app.post('/v1/checkout/create-session', async (req, res) => {
+  try {
+    const { 
+      userId, 
+      eventId, 
+      eventName,
+      items, // Array of { ticketTypeId, ticketTypeName, priceCents, quantity }
+      connectedAccountId,
+      successUrl,
+      cancelUrl
+    } = req.body;
+
+    // Validate required fields
+    if (!userId || !eventId || !items || !Array.isArray(items) || items.length === 0 || !connectedAccountId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: { 
+          type: 'invalid_request_error', 
+          message: 'Missing required fields: userId, eventId, items, and connectedAccountId are required' 
+        } 
+      });
+    }
+
+    // Calculate totals server-side using Model A pricing
+    let ticketSubtotalCents = 0;
+    let buyerFeeTotalCents = 0;
+
+    const itemsWithFees = items.map((item: any) => {
+      const { ticketTypeId, ticketTypeName, priceCents, quantity } = item;
+      
+      if (!ticketTypeId || !ticketTypeName || typeof priceCents !== 'number' || typeof quantity !== 'number') {
+        throw new Error('Invalid item format');
+      }
+
+      // Calculate buyer fee per ticket (covers YardLine $0.99 + Stripe fees)
+      const buyerFeePerTicket = calculateBuyerFeePerTicket(priceCents);
+      const buyerFeeCents = buyerFeePerTicket * quantity;
+
+      // Validate the pricing model for each ticket
+      const validation = validateModelAPricing(priceCents, buyerFeePerTicket);
+      if (!validation.isValid) {
+        console.warn(`⚠️  Model A validation warning: ${validation.details}`);
+      } else {
+        console.log(`✅ Model A validated: ${validation.details}`);
+      }
+
+      ticketSubtotalCents += priceCents * quantity;
+      buyerFeeTotalCents += buyerFeeCents;
+
+      return {
+        ticketTypeId,
+        ticketTypeName,
+        priceCents,
+        quantity,
+        buyerFeeCents,
+        buyerFeePerTicket
+      };
+    });
+
+    const totalChargeCents = ticketSubtotalCents + buyerFeeTotalCents;
+
+    // Review mode guardrail
+    if (REVIEW_MODE && totalChargeCents > REVIEW_MODE_MAX_CHARGE_CENTS) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: 'review_mode_error',
+          message: `Review mode is enabled. Maximum charge is $${REVIEW_MODE_MAX_CHARGE_CENTS / 100}`,
+          code: 'review_mode_limit_exceeded'
+        }
+      });
+    }
+
+    // Minimum charge validation
+    if (totalChargeCents < 50) {
+      return res.status(400).json({ 
+        success: false, 
+        error: { 
+          type: 'invalid_request_error', 
+          message: 'Amount must be at least $0.50 USD', 
+          code: 'amount_too_small' 
+        } 
+      });
+    }
+
+    // Create line items for Checkout
+    const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = [];
+    
+    // Add ticket line items
+    for (const item of itemsWithFees) {
+      lineItems.push({
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: item.ticketTypeName,
+            description: `${eventName || 'Event'} - ${item.ticketTypeName}`,
+          },
+          unit_amount: item.priceCents,
+        },
+        quantity: item.quantity,
+      });
+    }
+
+    // Add service & processing fee as a single line item
+    lineItems.push({
+      price_data: {
+        currency: 'usd',
+        product_data: {
+          name: 'Service & processing fee',
+          description: 'Covers platform services and payment processing',
+        },
+        unit_amount: buyerFeeTotalCents,
+      },
+      quantity: 1,
+    });
+
+    // Create Checkout Session with Model A pricing structure
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: lineItems,
+      success_url: successUrl || `https://yardline.app/checkout/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: cancelUrl || 'https://yardline.app/checkout/cancel',
+      payment_intent_data: {
+        application_fee_amount: 99, // YardLine nets exactly $0.99 per ticket (in cents)
+        transfer_data: {
+          destination: connectedAccountId, // Host receives ticket price
+        },
+        metadata: {
+          user_id: userId,
+          event_id: eventId,
+          pricing_model: 'model_a',
+          ticket_subtotal_cents: String(ticketSubtotalCents),
+          buyer_fee_total_cents: String(buyerFeeTotalCents),
+          total_charge_cents: String(totalChargeCents),
+          items_json: JSON.stringify(itemsWithFees),
+          review_mode: String(REVIEW_MODE)
+        },
+      },
+      metadata: {
+        user_id: userId,
+        event_id: eventId,
+        pricing_model: 'model_a',
+      },
+    });
+
+    console.log(`✅ Created Checkout Session ${session.id} for event ${eventId}`);
+    console.log(`   Total: $${(totalChargeCents / 100).toFixed(2)}, Ticket: $${(ticketSubtotalCents / 100).toFixed(2)}, Fee: $${(buyerFeeTotalCents / 100).toFixed(2)}`);
+
+    res.json({ 
+      success: true, 
+      data: {
+        sessionId: session.id,
+        sessionUrl: session.url,
+        ticketSubtotalCents,
+        buyerFeeTotalCents,
+        totalChargeCents,
+        mode: getStripeMode(),
+        pricingModel: 'model_a'
+      }
+    });
+  } catch (error) {
+    console.error('Error creating checkout session:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: { 
+        type: 'api_error', 
+        message: error instanceof Error ? error.message : 'Failed to create checkout session' 
+      } 
+    });
+  }
+});
+
+// GET /v1/checkout/session/:sessionId - Retrieve and verify Checkout Session
+// Used after checkout success to verify payment and retrieve order details
+app.get('/v1/checkout/session/:sessionId', async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    
+    // Retrieve the checkout session
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ['payment_intent', 'line_items'],
+    });
+
+    // Get tickets if they've been created
+    const sessionTickets = tickets.get(sessionId) || [];
+    const paymentIntentId = session.payment_intent as string;
+    const paymentIntentTickets = paymentIntentId ? tickets.get(paymentIntentId) || [] : [];
+    const allTickets = [...sessionTickets, ...paymentIntentTickets];
+
+    res.json({
+      success: true,
+      data: {
+        sessionId: session.id,
+        paymentStatus: session.payment_status,
+        paymentIntentId: paymentIntentId,
+        customerEmail: session.customer_details?.email,
+        amountTotal: session.amount_total,
+        currency: session.currency,
+        metadata: session.metadata,
+        tickets: allTickets,
+        ticketsCreated: allTickets.length > 0,
+        mode: getStripeMode()
+      }
+    });
+  } catch (error) {
+    console.error('Error retrieving checkout session:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: { 
+        type: 'api_error', 
+        message: error instanceof Error ? error.message : 'Failed to retrieve checkout session' 
+      } 
+    });
   }
 });
 
@@ -778,6 +1084,12 @@ app.get('/v1/tickets/by-payment/:paymentIntentId', (req, res) => {
   const { paymentIntentId } = req.params;
   const paymentTickets = tickets.get(paymentIntentId) || [];
   res.json({ success: true, data: paymentTickets });
+});
+
+app.get('/v1/tickets/by-session/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  const sessionTickets = tickets.get(sessionId) || [];
+  res.json({ success: true, data: sessionTickets });
 });
 
 app.listen(PORT, () => {
