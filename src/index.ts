@@ -74,12 +74,52 @@ const stripe = new Stripe(getStripeSecretKey(), {
 const REVIEW_MODE = process.env.REVIEW_MODE === 'true';
 const REVIEW_MODE_MAX_CHARGE_CENTS = 100; // $1.00 max in review mode
 
-// Calculate platform fee per ticket using the exact formula
-// Formula: max(0.99, min(8% of item price AFTER discount, 12.99))
-function calculatePlatformFeePerTicket(ticketPriceCents: number): number {
-  const eightPercent = Math.round(ticketPriceCents * 0.08);
-  const feeCents = Math.max(99, Math.min(eightPercent, 1299));
-  return feeCents;
+// ============================================================================
+// MODEL A PRICING: Buyer Pays All Fees
+// ============================================================================
+// Host receives 100% of ticket price
+// Buyer pays: $0.99 YardLine fee + Stripe processing fees (2.9% + $0.30)
+// Formula ensures YardLine nets exactly $0.99 after Stripe takes their cut
+// ============================================================================
+function calculateBuyerFeePerTicket(ticketPriceCents: number): number {
+  // Model A formula: buyerFee = (99 + 0.029 * ticketPrice + 30) / (1 - 0.029)
+  // This ensures YardLine nets $0.99 after Stripe takes 2.9% + $0.30
+  const buyerFeeCents = Math.ceil(
+    (99 + 0.029 * ticketPriceCents + 30) / (1 - 0.029)
+  );
+  return buyerFeeCents;
+}
+
+// Validation function to verify Model A pricing math
+function validateModelAPricing(ticketPriceCents: number, buyerFeeCents: number): {
+  isValid: boolean;
+  yardlineRevenue: number;
+  hostPayout: number;
+  buyerTotal: number;
+  stripeFeesApprox: number;
+  details: string;
+} {
+  const totalChargeCents = ticketPriceCents + buyerFeeCents;
+  
+  // Stripe takes 2.9% + $0.30 from the total charge
+  const stripeFeesCents = Math.round(totalChargeCents * 0.029 + 30);
+  
+  // In Connect with destination charge:
+  // - Host receives ticketPriceCents (the application_fee_amount goes to host)
+  // - YardLine receives buyerFeeCents - stripeFeesCents
+  const yardlineRevenueCents = buyerFeeCents - stripeFeesCents;
+  
+  // Validate YardLine gets $0.99 (allow 1 cent tolerance for rounding)
+  const isValid = Math.abs(yardlineRevenueCents - 99) <= 1;
+  
+  return {
+    isValid,
+    yardlineRevenue: yardlineRevenueCents,
+    hostPayout: ticketPriceCents,
+    buyerTotal: totalChargeCents,
+    stripeFeesApprox: stripeFeesCents,
+    details: `Ticket: $${(ticketPriceCents/100).toFixed(2)}, Buyer Fee: $${(buyerFeeCents/100).toFixed(2)}, Total: $${(totalChargeCents/100).toFixed(2)}, YardLine Net: $${(yardlineRevenueCents/100).toFixed(2)}, Host Gets: $${(ticketPriceCents/100).toFixed(2)}`
+  };
 }
 
 app.use(cors({
@@ -186,7 +226,10 @@ async function handlePaymentSucceeded(paymentIntent: Stripe.PaymentIntent) {
       ticketTypeName: string; 
       priceCents: number; 
       quantity: number; 
-      platformFeeCents: number;
+      buyerFeeCents?: number;
+      buyerFeePerTicket?: number;
+      // Legacy field names
+      platformFeeCents?: number;
       platformFeePerTicket?: number;
     }>;
     
@@ -203,7 +246,7 @@ async function handlePaymentSucceeded(paymentIntent: Stripe.PaymentIntent) {
           ticketTypeId: item.ticketTypeId,
           ticketTypeName: item.ticketTypeName,
           priceCents: item.priceCents,
-          feesCents: item.platformFeePerTicket || Math.round(item.platformFeeCents / item.quantity),
+          feesCents: item.buyerFeePerTicket || item.platformFeePerTicket || Math.round((item.buyerFeeCents || item.platformFeeCents || 0) / item.quantity),
           paymentIntentId: paymentIntent.id,
           status: 'confirmed',
           createdAt: new Date().toISOString(),
@@ -482,9 +525,9 @@ app.post('/v1/payments/create-intent', async (req, res) => {
       });
     }
 
-    // Calculate totals server-side
+    // Calculate totals server-side using Model A pricing
     let ticketSubtotalCents = 0;
-    let platformFeeTotalCents = 0;
+    let buyerFeeTotalCents = 0;
 
     const itemsWithFees = items.map((item: any) => {
       const { ticketTypeId, ticketTypeName, priceCents, quantity } = item;
@@ -493,24 +536,35 @@ app.post('/v1/payments/create-intent', async (req, res) => {
         throw new Error('Invalid item format');
       }
 
-      // Calculate platform fee per ticket using the formula
-      const platformFeePerTicket = calculatePlatformFeePerTicket(priceCents);
-      const platformFeeCents = platformFeePerTicket * quantity;
+      // Calculate buyer fee per ticket (covers YardLine $0.99 + Stripe fees)
+      const buyerFeePerTicket = calculateBuyerFeePerTicket(priceCents);
+      const buyerFeeCents = buyerFeePerTicket * quantity;
+
+      // Validate the pricing model for each ticket
+      const validation = validateModelAPricing(priceCents, buyerFeePerTicket);
+      if (!validation.isValid) {
+        console.warn(`⚠️  Model A validation warning: ${validation.details}`);
+      } else {
+        console.log(`✅ Model A validated: ${validation.details}`);
+      }
 
       ticketSubtotalCents += priceCents * quantity;
-      platformFeeTotalCents += platformFeeCents;
+      buyerFeeTotalCents += buyerFeeCents;
 
       return {
         ticketTypeId,
         ticketTypeName,
         priceCents,
         quantity,
-        platformFeeCents,
-        platformFeePerTicket
+        buyerFeeCents,
+        buyerFeePerTicket,
+        // Legacy field names for backward compatibility
+        platformFeeCents: buyerFeeCents,
+        platformFeePerTicket: buyerFeePerTicket
       };
     });
 
-    const totalChargeCents = ticketSubtotalCents + platformFeeTotalCents;
+    const totalChargeCents = ticketSubtotalCents + buyerFeeTotalCents;
 
     // Review mode guardrail - prevent large charges during App Store review
     if (REVIEW_MODE && totalChargeCents > REVIEW_MODE_MAX_CHARGE_CENTS) {
@@ -567,9 +621,9 @@ app.post('/v1/payments/create-intent', async (req, res) => {
       ephemeralKeySecret = ephemeralKey.secret;
     }
 
-    // Create PaymentIntent
+    // Create PaymentIntent with Model A structure
     const paymentIntentParams: Stripe.PaymentIntentCreateParams = {
-      amount: totalChargeCents,
+      amount: totalChargeCents, // Buyer pays: ticket price + buyer fee
       currency: 'usd',
       description: description || `YardLine Event Tickets - ${eventId}`,
       metadata: {
@@ -577,8 +631,11 @@ app.post('/v1/payments/create-intent', async (req, res) => {
         event_id: eventId,
         items_json: JSON.stringify(itemsWithFees),
         ticket_subtotal_cents: String(ticketSubtotalCents),
-        platform_fee_total_cents: String(platformFeeTotalCents),
+        buyer_fee_total_cents: String(buyerFeeTotalCents),
+        // Legacy field names for compatibility
+        platform_fee_total_cents: String(buyerFeeTotalCents),
         total_charge_cents: String(totalChargeCents),
+        pricing_model: 'model_a',
         review_mode: String(REVIEW_MODE)
       },
       automatic_payment_methods: { 
@@ -593,11 +650,14 @@ app.post('/v1/payments/create-intent', async (req, res) => {
     }
 
     // Configure Connect transfer if selling on behalf of connected account
+    // MODEL A: application_fee_amount = ticketSubtotal (host receives 100% of ticket price)
+    // Buyer fee covers Stripe fees + YardLine revenue
     if (connectedAccountId) {
       paymentIntentParams.transfer_data = { 
         destination: connectedAccountId 
       };
-      paymentIntentParams.application_fee_amount = platformFeeTotalCents;
+      // Host receives the full ticket price (this is transferred to their account)
+      paymentIntentParams.application_fee_amount = ticketSubtotalCents;
       paymentIntentParams.metadata!.connected_account = connectedAccountId;
     }
 
@@ -620,10 +680,14 @@ app.post('/v1/payments/create-intent', async (req, res) => {
         amount: totalChargeCents,
         currency: 'usd',
         ticketSubtotalCents,
-        platformFeeTotalCents,
+        buyerFeeTotalCents,
+        // Legacy field names for backward compatibility
+        platformFeeTotalCents: buyerFeeTotalCents,
+        serviceAndProcessingFeeCents: buyerFeeTotalCents,
         itemsWithFees,
         mode: getStripeMode(),
-        reviewMode: REVIEW_MODE
+        reviewMode: REVIEW_MODE,
+        pricingModel: 'model_a'
       }
     });
   } catch (error) {
@@ -638,23 +702,36 @@ app.post('/v1/payments/create-intent', async (req, res) => {
   }
 });
 
-// Legacy endpoint - kept for backward compatibility but calculates fees server-side now
+// Legacy endpoint - kept for backward compatibility but uses Model A pricing
 app.post('/v1/stripe/payment-intents', async (req, res) => {
   try {
-    const { connectedAccountId, items, ticketSubtotalCents, platformFeeTotalCents, totalChargeCents, description, metadata, idempotencyKey } = req.body;
+    const { connectedAccountId, items, ticketSubtotalCents, platformFeeTotalCents, buyerFeeTotalCents, totalChargeCents, description, metadata, idempotencyKey } = req.body;
     if (totalChargeCents < 50) {
       return res.status(400).json({ success: false, error: { type: 'invalid_request_error', message: 'Amount must be at least $0.50 USD', code: 'amount_too_small' } });
     }
+    
+    // Use buyerFeeTotalCents if provided, otherwise fall back to platformFeeTotalCents for backward compatibility
+    const feeTotalCents = buyerFeeTotalCents || platformFeeTotalCents;
+    
     const paymentIntentParams: Stripe.PaymentIntentCreateParams = {
       amount: totalChargeCents,
       currency: 'usd',
       description: description || 'YardLine Ticket Purchase',
-      metadata: { ...metadata, items_json: JSON.stringify(items), ticket_subtotal_cents: String(ticketSubtotalCents), platform_fee_total_cents: String(platformFeeTotalCents), total_charge_cents: String(totalChargeCents) },
+      metadata: { 
+        ...metadata, 
+        items_json: JSON.stringify(items), 
+        ticket_subtotal_cents: String(ticketSubtotalCents), 
+        buyer_fee_total_cents: String(feeTotalCents),
+        platform_fee_total_cents: String(feeTotalCents), // Legacy field
+        total_charge_cents: String(totalChargeCents),
+        pricing_model: 'model_a'
+      },
       automatic_payment_methods: { enabled: true },
     };
     if (connectedAccountId) {
       paymentIntentParams.transfer_data = { destination: connectedAccountId };
-      paymentIntentParams.application_fee_amount = platformFeeTotalCents;
+      // Model A: Host receives full ticket price
+      paymentIntentParams.application_fee_amount = ticketSubtotalCents;
       paymentIntentParams.metadata!.connected_account = connectedAccountId;
     }
     const paymentIntent = await stripe.paymentIntents.create(paymentIntentParams, idempotencyKey ? { idempotencyKey } : undefined);
