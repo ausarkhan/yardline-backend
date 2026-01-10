@@ -2,9 +2,28 @@ import express from 'express';
 import cors from 'cors';
 import Stripe from 'stripe';
 import { v4 as uuidv4 } from 'uuid';
+import { createClient } from '@supabase/supabase-js';
+import * as db from './db';
+import { authenticateUser, optionalAuth } from './middleware/auth';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Supabase configuration
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured');
+}
+
+// Initialize Supabase client with service role key (bypasses RLS for admin operations)
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: {
+    autoRefreshToken: false,
+    persistSession: false
+  }
+});
 
 // Environment-based Stripe configuration
 // Supports two modes:
@@ -132,36 +151,10 @@ function calculateBookingPlatformFee(servicePriceCents: number): number {
   return calculateBuyerFeePerTicket(servicePriceCents);
 }
 
-// Check if provider has a conflicting booking at the requested time
-function hasConflictingBooking(providerId: string, requestedDate: string, requestedTime: string, duration: number, excludeBookingId?: string): boolean {
-  const providerBookingIds = providerBookings.get(providerId);
-  if (!providerBookingIds || providerBookingIds.size === 0) {
-    return false;
-  }
-
-  const requestedStart = new Date(`${requestedDate}T${requestedTime}:00`);
-  const requestedEnd = new Date(requestedStart.getTime() + duration * 60000);
-
-  for (const bookingId of providerBookingIds) {
-    if (bookingId === excludeBookingId) continue;
-    
-    const booking = bookings.get(bookingId);
-    if (!booking || booking.status !== 'confirmed') continue;
-
-    // Get service to determine duration
-    const service = services.get(booking.serviceId);
-    if (!service) continue;
-
-    const existingStart = new Date(`${booking.requestedDate}T${booking.requestedTime}:00`);
-    const existingEnd = new Date(existingStart.getTime() + service.duration * 60000);
-
-    // Check for overlap
-    if (requestedStart < existingEnd && requestedEnd > existingStart) {
-      return true;
-    }
-  }
-
-  return false;
+// Database-backed conflict checking is now handled in db.ts
+// This function is kept for backward compatibility but delegates to database
+async function hasConflictingBooking(providerId: string, timeStart: string, timeEnd: string, excludeBookingId?: string): Promise<boolean> {
+  return await db.checkBookingConflict(supabase, providerId, timeStart, timeEnd, excludeBookingId);
 }
 
 app.use(cors({
@@ -231,16 +224,13 @@ interface Service {
   active: boolean;
 }
 
+// Keep in-memory storage for Connect accounts and tickets (these can be migrated to DB later)
 const connectAccounts: Map<string, ConnectAccount> = new Map();
 const tickets: Map<string, Ticket[]> = new Map();
 const processedPaymentIntents: Set<string> = new Set(); // Idempotency tracking for webhook processing
-
-// Booking system storage
-const bookings: Map<string, Booking> = new Map(); // bookingId -> Booking
-const services: Map<string, Service> = new Map(); // serviceId -> Service
-const providerBookings: Map<string, Set<string>> = new Map(); // providerId -> Set of bookingIds
-const customerBookings: Map<string, Set<string>> = new Map(); // customerId -> Set of bookingIds
 const processedWebhookEvents: Set<string> = new Set(); // Track processed webhook event IDs for idempotency
+
+// Note: Bookings and Services are now stored in Supabase database, not in-memory
 
 // User records structure to track both test and live Stripe account IDs
 interface UserStripeAccounts {
@@ -446,62 +436,74 @@ async function handleBookingPaymentEvent(paymentIntent: Stripe.PaymentIntent) {
     return;
   }
 
-  const booking = bookings.get(bookingId);
-  if (!booking) {
-    console.error(`Booking ${bookingId} not found for payment intent ${paymentIntent.id}`);
-    return;
-  }
+  try {
+    const booking = await db.getBooking(supabase, bookingId);
+    if (!booking) {
+      console.error(`Booking ${bookingId} not found for payment intent ${paymentIntent.id}`);
+      return;
+    }
 
-  // Update booking payment status based on payment intent status
-  switch (paymentIntent.status) {
-    case 'requires_capture':
-      // Payment authorized successfully
-      if (booking.payment_status !== 'authorized') {
-        booking.payment_status = 'authorized';
-        booking.updated_at = new Date().toISOString();
-        bookings.set(bookingId, booking);
-        console.log(`✅ Booking ${bookingId} payment authorized (webhook)`);
-      }
-      break;
+    // Update booking payment status based on payment intent status
+    let newPaymentStatus: db.DBBooking['payment_status'] | null = null;
+    let newStatus: db.DBBooking['status'] | null = null;
 
-    case 'succeeded':
-      // Payment captured successfully
-      if (booking.payment_status !== 'captured') {
-        booking.payment_status = 'captured';
-        if (booking.status === 'pending') {
-          booking.status = 'confirmed';
+    switch (paymentIntent.status) {
+      case 'requires_capture':
+        // Payment authorized successfully
+        if (booking.payment_status !== 'authorized') {
+          newPaymentStatus = 'authorized';
+          console.log(`✅ Booking ${bookingId} payment authorized (webhook)`);
         }
-        booking.updated_at = new Date().toISOString();
-        bookings.set(bookingId, booking);
-        console.log(`✅ Booking ${bookingId} payment captured (webhook)`);
-      }
-      break;
+        break;
 
-    case 'canceled':
-      // Payment canceled
-      if (booking.payment_status !== 'canceled') {
-        booking.payment_status = 'canceled';
-        if (booking.status === 'pending') {
-          booking.status = 'cancelled';
+      case 'succeeded':
+        // Payment captured successfully
+        if (booking.payment_status !== 'captured') {
+          newPaymentStatus = 'captured';
+          if (booking.status === 'pending') {
+            newStatus = 'confirmed';
+          }
+          console.log(`✅ Booking ${bookingId} payment captured (webhook)`);
         }
-        booking.updated_at = new Date().toISOString();
-        bookings.set(bookingId, booking);
-        console.log(`✅ Booking ${bookingId} payment canceled (webhook)`);
-      }
-      break;
+        break;
 
-    case 'requires_payment_method':
-    case 'processing':
-      // Payment in progress or requires action
-      console.log(`ℹ️  Booking ${bookingId} payment status: ${paymentIntent.status}`);
-      break;
+      case 'canceled':
+        // Payment canceled
+        if (booking.payment_status !== 'canceled') {
+          newPaymentStatus = 'canceled';
+          if (booking.status === 'pending') {
+            newStatus = 'cancelled';
+          }
+          console.log(`✅ Booking ${bookingId} payment canceled (webhook)`);
+        }
+        break;
 
-    default:
-      console.log(`⚠️  Unhandled payment intent status for booking ${bookingId}: ${paymentIntent.status}`);
+      case 'requires_payment_method':
+      case 'processing':
+        // Payment in progress or requires action
+        console.log(`ℹ️  Booking ${bookingId} payment status: ${paymentIntent.status}`);
+        break;
+
+      default:
+        console.log(`⚠️  Unhandled payment intent status for booking ${bookingId}: ${paymentIntent.status}`);
+    }
+
+    // Update database if status changed
+    if (newPaymentStatus || newStatus) {
+      await db.updateBookingStatus(
+        supabase,
+        bookingId,
+        newStatus || booking.status,
+        newPaymentStatus || booking.payment_status
+      );
+    }
+
+    // Mark event as processed
+    processedWebhookEvents.add(eventKey);
+  } catch (error) {
+    console.error(`Error processing booking payment event for ${bookingId}:`, error);
+    throw error; // Let webhook handler retry
   }
-
-  // Mark event as processed
-  processedWebhookEvents.add(eventKey);
 }
 
 // Handler function for payment failure events (bookings)
@@ -519,24 +521,25 @@ async function handleBookingPaymentFailed(paymentIntent: Stripe.PaymentIntent) {
     return;
   }
 
-  const booking = bookings.get(bookingId);
-  if (!booking) {
-    console.error(`Booking ${bookingId} not found for failed payment ${paymentIntent.id}`);
-    return;
+  try {
+    const booking = await db.getBooking(supabase, bookingId);
+    if (!booking) {
+      console.error(`Booking ${bookingId} not found for failed payment ${paymentIntent.id}`);
+      return;
+    }
+
+    // Update booking to reflect payment failure
+    const newStatus = booking.status === 'pending' ? 'cancelled' : booking.status;
+    await db.updateBookingStatus(supabase, bookingId, newStatus, 'failed');
+
+    console.log(`❌ Booking ${bookingId} payment failed (webhook)`);
+
+    // Mark event as processed
+    processedWebhookEvents.add(eventKey);
+  } catch (error) {
+    console.error(`Error processing booking payment failure for ${bookingId}:`, error);
+    throw error; // Let webhook handler retry
   }
-
-  // Update booking to reflect payment failure
-  booking.payment_status = 'failed';
-  if (booking.status === 'pending') {
-    booking.status = 'cancelled';
-  }
-  booking.updated_at = new Date().toISOString();
-  bookings.set(bookingId, booking);
-
-  console.log(`❌ Booking ${bookingId} payment failed (webhook)`);
-
-  // Mark event as processed
-  processedWebhookEvents.add(eventKey);
 }
 
 // ============================================================================
