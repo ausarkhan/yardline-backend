@@ -122,6 +122,48 @@ function validateModelAPricing(ticketPriceCents: number, buyerFeeCents: number):
   };
 }
 
+// ============================================================================
+// BOOKING SYSTEM HELPERS
+// ============================================================================
+
+// Calculate platform fee for bookings (Model A pricing)
+function calculateBookingPlatformFee(servicePriceCents: number): number {
+  // Use same Model A formula: buyerFee = (99 + 0.029 * price + 30) / (1 - 0.029)
+  return calculateBuyerFeePerTicket(servicePriceCents);
+}
+
+// Check if provider has a conflicting booking at the requested time
+function hasConflictingBooking(providerId: string, requestedDate: string, requestedTime: string, duration: number, excludeBookingId?: string): boolean {
+  const providerBookingIds = providerBookings.get(providerId);
+  if (!providerBookingIds || providerBookingIds.size === 0) {
+    return false;
+  }
+
+  const requestedStart = new Date(`${requestedDate}T${requestedTime}:00`);
+  const requestedEnd = new Date(requestedStart.getTime() + duration * 60000);
+
+  for (const bookingId of providerBookingIds) {
+    if (bookingId === excludeBookingId) continue;
+    
+    const booking = bookings.get(bookingId);
+    if (!booking || booking.status !== 'confirmed') continue;
+
+    // Get service to determine duration
+    const service = services.get(booking.serviceId);
+    if (!service) continue;
+
+    const existingStart = new Date(`${booking.requestedDate}T${booking.requestedTime}:00`);
+    const existingEnd = new Date(existingStart.getTime() + service.duration * 60000);
+
+    // Check for overlap
+    if (requestedStart < existingEnd && requestedEnd > existingStart) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -156,9 +198,49 @@ interface Ticket {
   createdAt: string;
 }
 
+// Booking system types for service requests
+type BookingStatus = 'pending' | 'confirmed' | 'declined' | 'cancelled' | 'expired';
+type PaymentStatus = 'none' | 'authorized' | 'captured' | 'canceled' | 'failed';
+
+interface Booking {
+  bookingId: string;
+  customerId: string;
+  providerId: string;
+  serviceId: string;
+  serviceName: string;
+  requestedDate: string; // ISO 8601 date string
+  requestedTime: string; // Time slot (e.g., "14:00")
+  status: BookingStatus;
+  payment_status: PaymentStatus;
+  payment_intent_id: string | null;
+  amount_total: number; // Amount in cents for audit trail
+  service_price_cents: number;
+  platform_fee_cents: number;
+  decline_reason?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface Service {
+  serviceId: string;
+  providerId: string;
+  name: string;
+  description: string;
+  priceCents: number;
+  duration: number; // Duration in minutes
+  active: boolean;
+}
+
 const connectAccounts: Map<string, ConnectAccount> = new Map();
 const tickets: Map<string, Ticket[]> = new Map();
 const processedPaymentIntents: Set<string> = new Set(); // Idempotency tracking for webhook processing
+
+// Booking system storage
+const bookings: Map<string, Booking> = new Map(); // bookingId -> Booking
+const services: Map<string, Service> = new Map(); // serviceId -> Service
+const providerBookings: Map<string, Set<string>> = new Map(); // providerId -> Set of bookingIds
+const customerBookings: Map<string, Set<string>> = new Map(); // customerId -> Set of bookingIds
+const processedWebhookEvents: Set<string> = new Set(); // Track processed webhook event IDs for idempotency
 
 // User records structure to track both test and live Stripe account IDs
 interface UserStripeAccounts {
@@ -348,6 +430,115 @@ async function handlePaymentSucceeded(paymentIntent: Stripe.PaymentIntent) {
   }
 }
 
+// Handler function for booking payment events
+async function handleBookingPaymentEvent(paymentIntent: Stripe.PaymentIntent) {
+  // Check if this payment intent is associated with a booking
+  const bookingId = paymentIntent.metadata.booking_id;
+  if (!bookingId) {
+    // Not a booking payment, skip
+    return;
+  }
+
+  // Idempotency check using event-specific tracking
+  const eventKey = `booking_payment_${paymentIntent.id}_${paymentIntent.status}`;
+  if (processedWebhookEvents.has(eventKey)) {
+    console.log(`Booking payment event ${eventKey} already processed, skipping`);
+    return;
+  }
+
+  const booking = bookings.get(bookingId);
+  if (!booking) {
+    console.error(`Booking ${bookingId} not found for payment intent ${paymentIntent.id}`);
+    return;
+  }
+
+  // Update booking payment status based on payment intent status
+  switch (paymentIntent.status) {
+    case 'requires_capture':
+      // Payment authorized successfully
+      if (booking.payment_status !== 'authorized') {
+        booking.payment_status = 'authorized';
+        booking.updated_at = new Date().toISOString();
+        bookings.set(bookingId, booking);
+        console.log(`✅ Booking ${bookingId} payment authorized (webhook)`);
+      }
+      break;
+
+    case 'succeeded':
+      // Payment captured successfully
+      if (booking.payment_status !== 'captured') {
+        booking.payment_status = 'captured';
+        if (booking.status === 'pending') {
+          booking.status = 'confirmed';
+        }
+        booking.updated_at = new Date().toISOString();
+        bookings.set(bookingId, booking);
+        console.log(`✅ Booking ${bookingId} payment captured (webhook)`);
+      }
+      break;
+
+    case 'canceled':
+      // Payment canceled
+      if (booking.payment_status !== 'canceled') {
+        booking.payment_status = 'canceled';
+        if (booking.status === 'pending') {
+          booking.status = 'cancelled';
+        }
+        booking.updated_at = new Date().toISOString();
+        bookings.set(bookingId, booking);
+        console.log(`✅ Booking ${bookingId} payment canceled (webhook)`);
+      }
+      break;
+
+    case 'requires_payment_method':
+    case 'processing':
+      // Payment in progress or requires action
+      console.log(`ℹ️  Booking ${bookingId} payment status: ${paymentIntent.status}`);
+      break;
+
+    default:
+      console.log(`⚠️  Unhandled payment intent status for booking ${bookingId}: ${paymentIntent.status}`);
+  }
+
+  // Mark event as processed
+  processedWebhookEvents.add(eventKey);
+}
+
+// Handler function for payment failure events (bookings)
+async function handleBookingPaymentFailed(paymentIntent: Stripe.PaymentIntent) {
+  const bookingId = paymentIntent.metadata.booking_id;
+  if (!bookingId) {
+    // Not a booking payment, skip
+    return;
+  }
+
+  // Idempotency check
+  const eventKey = `booking_payment_failed_${paymentIntent.id}`;
+  if (processedWebhookEvents.has(eventKey)) {
+    console.log(`Booking payment failed event ${eventKey} already processed, skipping`);
+    return;
+  }
+
+  const booking = bookings.get(bookingId);
+  if (!booking) {
+    console.error(`Booking ${bookingId} not found for failed payment ${paymentIntent.id}`);
+    return;
+  }
+
+  // Update booking to reflect payment failure
+  booking.payment_status = 'failed';
+  if (booking.status === 'pending') {
+    booking.status = 'cancelled';
+  }
+  booking.updated_at = new Date().toISOString();
+  bookings.set(bookingId, booking);
+
+  console.log(`❌ Booking ${bookingId} payment failed (webhook)`);
+
+  // Mark event as processed
+  processedWebhookEvents.add(eventKey);
+}
+
 // ============================================================================
 // STRIPE WEBHOOK ENDPOINT - CRITICAL: Must be defined BEFORE express.json()
 // ============================================================================
@@ -424,13 +615,27 @@ app.post(
         case 'payment_intent.succeeded':
           const paymentIntent = event.data.object as Stripe.PaymentIntent;
           console.log(`💰 Payment succeeded: ${paymentIntent.id} - Amount: ${paymentIntent.amount}`);
+          // Handle both ticket purchases and bookings
           await handlePaymentSucceeded(paymentIntent);
+          await handleBookingPaymentEvent(paymentIntent);
+          break;
+
+        case 'payment_intent.canceled':
+          const canceledPayment = event.data.object as Stripe.PaymentIntent;
+          console.log(`🚫 Payment canceled: ${canceledPayment.id}`);
+          await handleBookingPaymentEvent(canceledPayment);
           break;
 
         case 'payment_intent.payment_failed':
           const failedPayment = event.data.object as Stripe.PaymentIntent;
           console.log(`❌ Payment failed: ${failedPayment.id}`);
-          // Handle payment failure logic here if needed
+          await handleBookingPaymentFailed(failedPayment);
+          break;
+
+        case 'payment_intent.requires_action':
+          const requiresActionPayment = event.data.object as Stripe.PaymentIntent;
+          console.log(`🔐 Payment requires action: ${requiresActionPayment.id}`);
+          await handleBookingPaymentEvent(requiresActionPayment);
           break;
 
         case 'account.updated':
@@ -1090,6 +1295,661 @@ app.get('/v1/tickets/by-session/:sessionId', (req, res) => {
   const { sessionId } = req.params;
   const sessionTickets = tickets.get(sessionId) || [];
   res.json({ success: true, data: sessionTickets });
+});
+
+// ============================================================================
+// BOOKING SYSTEM ENDPOINTS
+// ============================================================================
+
+// POST /v1/services - Create a service (provider only)
+app.post('/v1/services', (req, res) => {
+  try {
+    const { providerId, name, description, priceCents, duration } = req.body;
+
+    if (!providerId || !name || typeof priceCents !== 'number' || typeof duration !== 'number') {
+      return res.status(400).json({
+        success: false,
+        error: { type: 'invalid_request_error', message: 'Missing required fields: providerId, name, priceCents, duration' }
+      });
+    }
+
+    const serviceId = uuidv4();
+    const service: Service = {
+      serviceId,
+      providerId,
+      name,
+      description: description || '',
+      priceCents,
+      duration,
+      active: true
+    };
+
+    services.set(serviceId, service);
+
+    res.json({ success: true, data: service });
+  } catch (error) {
+    console.error('Error creating service:', error);
+    res.status(500).json({
+      success: false,
+      error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to create service' }
+    });
+  }
+});
+
+// GET /v1/services/:serviceId - Get service details
+app.get('/v1/services/:serviceId', (req, res) => {
+  try {
+    const { serviceId } = req.params;
+    const service = services.get(serviceId);
+
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        error: { type: 'resource_missing', message: 'Service not found' }
+      });
+    }
+
+    res.json({ success: true, data: service });
+  } catch (error) {
+    console.error('Error retrieving service:', error);
+    res.status(500).json({
+      success: false,
+      error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to retrieve service' }
+    });
+  }
+});
+
+// GET /v1/services - List services by provider
+app.get('/v1/services', (req, res) => {
+  try {
+    const { providerId } = req.query;
+
+    let serviceList = Array.from(services.values());
+
+    if (providerId) {
+      serviceList = serviceList.filter(s => s.providerId === providerId);
+    }
+
+    res.json({ success: true, data: serviceList });
+  } catch (error) {
+    console.error('Error listing services:', error);
+    res.status(500).json({
+      success: false,
+      error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to list services' }
+    });
+  }
+});
+
+// POST /v1/bookings - Create booking request with payment authorization (customer)
+app.post('/v1/bookings', async (req, res) => {
+  try {
+    const {
+      customerId,
+      serviceId,
+      requestedDate,
+      requestedTime,
+      customerEmail,
+      customerName
+    } = req.body;
+
+    // Validate required fields
+    if (!customerId || !serviceId || !requestedDate || !requestedTime) {
+      return res.status(400).json({
+        success: false,
+        error: { type: 'invalid_request_error', message: 'Missing required fields: customerId, serviceId, requestedDate, requestedTime' }
+      });
+    }
+
+    // Validate service exists and is active
+    const service = services.get(serviceId);
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        error: { type: 'resource_missing', message: 'Service not found' }
+      });
+    }
+
+    if (!service.active) {
+      return res.status(400).json({
+        success: false,
+        error: { type: 'invalid_request_error', message: 'Service is not available' }
+      });
+    }
+
+    // Validate date/time is in the future
+    const requestedDateTime = new Date(`${requestedDate}T${requestedTime}:00`);
+    if (requestedDateTime <= new Date()) {
+      return res.status(400).json({
+        success: false,
+        error: { type: 'invalid_request_error', message: 'Requested time must be in the future' }
+      });
+    }
+
+    // Calculate server-side pricing (Model A)
+    const servicePriceCents = service.priceCents;
+    const platformFeeCents = calculateBookingPlatformFee(servicePriceCents);
+    const totalChargeCents = servicePriceCents + platformFeeCents;
+
+    // Minimum charge validation
+    if (totalChargeCents < 50) {
+      return res.status(400).json({
+        success: false,
+        error: { type: 'invalid_request_error', message: 'Amount must be at least $0.50 USD', code: 'amount_too_small' }
+      });
+    }
+
+    // Review mode guardrail
+    if (REVIEW_MODE && totalChargeCents > REVIEW_MODE_MAX_CHARGE_CENTS) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: 'review_mode_error',
+          message: `Review mode is enabled. Maximum charge is $${REVIEW_MODE_MAX_CHARGE_CENTS / 100}`,
+          code: 'review_mode_limit_exceeded'
+        }
+      });
+    }
+
+    // Create booking ID
+    const bookingId = uuidv4();
+
+    // Create or retrieve Stripe Customer
+    let stripeCustomerId: string | undefined;
+    if (customerEmail) {
+      const customers = await stripe.customers.list({
+        email: customerEmail,
+        limit: 1
+      });
+
+      if (customers.data.length > 0) {
+        stripeCustomerId = customers.data[0].id;
+      } else {
+        const customer = await stripe.customers.create({
+          email: customerEmail,
+          name: customerName,
+          metadata: { customerId }
+        });
+        stripeCustomerId = customer.id;
+      }
+    }
+
+    // Create PaymentIntent with capture_method="manual" for authorization only
+    const paymentIntentParams: Stripe.PaymentIntentCreateParams = {
+      amount: totalChargeCents,
+      currency: 'usd',
+      capture_method: 'manual', // CRITICAL: Only authorize, don't capture until provider accepts
+      description: `YardLine Booking - ${service.name}`,
+      metadata: {
+        booking_id: bookingId,
+        customer_id: customerId,
+        provider_id: service.providerId,
+        service_id: serviceId,
+        service_name: service.name,
+        service_price_cents: String(servicePriceCents),
+        platform_fee_cents: String(platformFeeCents),
+        total_charge_cents: String(totalChargeCents),
+        requested_date: requestedDate,
+        requested_time: requestedTime,
+        pricing_model: 'model_a',
+        review_mode: String(REVIEW_MODE)
+      },
+      automatic_payment_methods: {
+        enabled: true,
+        allow_redirects: 'never'
+      }
+    };
+
+    if (stripeCustomerId) {
+      paymentIntentParams.customer = stripeCustomerId;
+    }
+
+    // Get provider's connected account ID for transfer configuration
+    const providerAccountId = await getOrCreateStripeAccountId(
+      service.providerId,
+      `provider-${service.providerId}@yardline.app`,
+      `Provider ${service.providerId}`
+    );
+
+    // Configure Stripe Connect transfer (Model A: provider gets service price)
+    paymentIntentParams.transfer_data = {
+      destination: providerAccountId
+    };
+    paymentIntentParams.application_fee_amount = servicePriceCents;
+    paymentIntentParams.metadata!.connected_account = providerAccountId;
+
+    // Create payment intent with idempotency
+    const idempotencyKey = `booking_${customerId}_${serviceId}_${Date.now()}`;
+    const paymentIntent = await stripe.paymentIntents.create(
+      paymentIntentParams,
+      { idempotencyKey }
+    );
+
+    // Confirm the payment intent to authorize (but not capture)
+    const confirmedPaymentIntent = await stripe.paymentIntents.confirm(paymentIntent.id, {
+      return_url: 'https://yardline.app/bookings/return' // Required for some payment methods
+    });
+
+    // Create booking record with pending status and authorized payment
+    const now = new Date().toISOString();
+    const booking: Booking = {
+      bookingId,
+      customerId,
+      providerId: service.providerId,
+      serviceId,
+      serviceName: service.name,
+      requestedDate,
+      requestedTime,
+      status: 'pending',
+      payment_status: confirmedPaymentIntent.status === 'requires_capture' ? 'authorized' : 'none',
+      payment_intent_id: paymentIntent.id,
+      amount_total: totalChargeCents,
+      service_price_cents: servicePriceCents,
+      platform_fee_cents: platformFeeCents,
+      created_at: now,
+      updated_at: now
+    };
+
+    // Store booking
+    bookings.set(bookingId, booking);
+
+    // Index by provider and customer
+    if (!providerBookings.has(service.providerId)) {
+      providerBookings.set(service.providerId, new Set());
+    }
+    providerBookings.get(service.providerId)!.add(bookingId);
+
+    if (!customerBookings.has(customerId)) {
+      customerBookings.set(customerId, new Set());
+    }
+    customerBookings.get(customerId)!.add(bookingId);
+
+    console.log(`✅ Created booking ${bookingId} with payment authorization (PaymentIntent: ${paymentIntent.id})`);
+    console.log(`   Service: ${service.name}, Price: $${(servicePriceCents/100).toFixed(2)}, Fee: $${(platformFeeCents/100).toFixed(2)}, Total: $${(totalChargeCents/100).toFixed(2)}`);
+
+    res.json({
+      success: true,
+      data: {
+        booking,
+        paymentIntentClientSecret: confirmedPaymentIntent.client_secret,
+        requiresAction: confirmedPaymentIntent.status === 'requires_action',
+        mode: getStripeMode()
+      }
+    });
+  } catch (error) {
+    console.error('Error creating booking:', error);
+    res.status(500).json({
+      success: false,
+      error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to create booking' }
+    });
+  }
+});
+
+// GET /v1/bookings/:id - Get booking details
+app.get('/v1/bookings/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    const booking = bookings.get(id);
+
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        error: { type: 'resource_missing', message: 'Booking not found' }
+      });
+    }
+
+    res.json({ success: true, data: booking });
+  } catch (error) {
+    console.error('Error retrieving booking:', error);
+    res.status(500).json({
+      success: false,
+      error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to retrieve booking' }
+    });
+  }
+});
+
+// GET /v1/bookings - List bookings (by customer or provider)
+app.get('/v1/bookings', (req, res) => {
+  try {
+    const { customerId, providerId, status } = req.query;
+
+    let bookingIds: Set<string> | undefined;
+
+    if (customerId) {
+      bookingIds = customerBookings.get(customerId as string);
+    } else if (providerId) {
+      bookingIds = providerBookings.get(providerId as string);
+    }
+
+    if (!bookingIds) {
+      return res.json({ success: true, data: [] });
+    }
+
+    let bookingList = Array.from(bookingIds).map(id => bookings.get(id)).filter(b => b !== undefined) as Booking[];
+
+    // Filter by status if provided
+    if (status) {
+      bookingList = bookingList.filter(b => b.status === status);
+    }
+
+    // Sort by creation date (newest first)
+    bookingList.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+    res.json({ success: true, data: bookingList });
+  } catch (error) {
+    console.error('Error listing bookings:', error);
+    res.status(500).json({
+      success: false,
+      error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to list bookings' }
+    });
+  }
+});
+
+// POST /v1/bookings/:id/accept - Provider accepts booking and captures payment
+app.post('/v1/bookings/:id/accept', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { providerId } = req.body;
+
+    if (!providerId) {
+      return res.status(400).json({
+        success: false,
+        error: { type: 'invalid_request_error', message: 'Missing required field: providerId' }
+      });
+    }
+
+    // Get booking
+    const booking = bookings.get(id);
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        error: { type: 'resource_missing', message: 'Booking not found' }
+      });
+    }
+
+    // Verify provider owns this booking
+    if (booking.providerId !== providerId) {
+      return res.status(403).json({
+        success: false,
+        error: { type: 'permission_denied', message: 'You do not have permission to accept this booking' }
+      });
+    }
+
+    // Enforce idempotency: only allow if status is pending
+    if (booking.status !== 'pending') {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: 'invalid_state',
+          message: `Cannot accept booking in ${booking.status} status`,
+          currentStatus: booking.status
+        }
+      });
+    }
+
+    // Check for double booking conflicts
+    const service = services.get(booking.serviceId);
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        error: { type: 'resource_missing', message: 'Service not found' }
+      });
+    }
+
+    const hasConflict = hasConflictingBooking(
+      booking.providerId,
+      booking.requestedDate,
+      booking.requestedTime,
+      service.duration,
+      booking.bookingId
+    );
+
+    if (hasConflict) {
+      return res.status(409).json({
+        success: false,
+        error: {
+          type: 'booking_conflict',
+          message: 'You have a conflicting booking at this time. Please decline this request.'
+        }
+      });
+    }
+
+    // Capture the PaymentIntent
+    if (!booking.payment_intent_id) {
+      return res.status(400).json({
+        success: false,
+        error: { type: 'invalid_state', message: 'No payment intent associated with this booking' }
+      });
+    }
+
+    try {
+      // Use idempotency key to prevent double capture
+      const captureIdempotencyKey = `capture_${booking.bookingId}`;
+      const capturedPaymentIntent = await stripe.paymentIntents.capture(
+        booking.payment_intent_id,
+        {},
+        { idempotencyKey: captureIdempotencyKey }
+      );
+
+      // Update booking status
+      booking.status = 'confirmed';
+      booking.payment_status = 'captured';
+      booking.updated_at = new Date().toISOString();
+      bookings.set(id, booking);
+
+      console.log(`✅ Booking ${id} accepted and payment captured (PaymentIntent: ${booking.payment_intent_id})`);
+
+      res.json({
+        success: true,
+        data: {
+          booking,
+          paymentIntentStatus: capturedPaymentIntent.status
+        }
+      });
+    } catch (stripeError: any) {
+      console.error('Error capturing payment:', stripeError);
+
+      // Handle authorization expiry
+      if (stripeError.code === 'charge_expired_for_capture') {
+        booking.status = 'expired';
+        booking.payment_status = 'failed';
+        booking.updated_at = new Date().toISOString();
+        bookings.set(id, booking);
+
+        return res.status(400).json({
+          success: false,
+          error: {
+            type: 'payment_expired',
+            message: 'Payment authorization has expired. Customer must re-confirm payment.',
+            code: 'charge_expired_for_capture'
+          }
+        });
+      }
+
+      // Other payment errors
+      booking.payment_status = 'failed';
+      booking.updated_at = new Date().toISOString();
+      bookings.set(id, booking);
+
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: 'payment_error',
+          message: stripeError.message || 'Failed to capture payment',
+          code: stripeError.code
+        }
+      });
+    }
+  } catch (error) {
+    console.error('Error accepting booking:', error);
+    res.status(500).json({
+      success: false,
+      error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to accept booking' }
+    });
+  }
+});
+
+// POST /v1/bookings/:id/decline - Provider declines booking and cancels payment authorization
+app.post('/v1/bookings/:id/decline', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { providerId, reason } = req.body;
+
+    if (!providerId) {
+      return res.status(400).json({
+        success: false,
+        error: { type: 'invalid_request_error', message: 'Missing required field: providerId' }
+      });
+    }
+
+    // Get booking
+    const booking = bookings.get(id);
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        error: { type: 'resource_missing', message: 'Booking not found' }
+      });
+    }
+
+    // Verify provider owns this booking
+    if (booking.providerId !== providerId) {
+      return res.status(403).json({
+        success: false,
+        error: { type: 'permission_denied', message: 'You do not have permission to decline this booking' }
+      });
+    }
+
+    // Enforce idempotency: only allow if status is pending
+    if (booking.status !== 'pending') {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: 'invalid_state',
+          message: `Cannot decline booking in ${booking.status} status`,
+          currentStatus: booking.status
+        }
+      });
+    }
+
+    // Cancel the PaymentIntent
+    if (booking.payment_intent_id) {
+      try {
+        await stripe.paymentIntents.cancel(booking.payment_intent_id);
+        console.log(`✅ Canceled PaymentIntent ${booking.payment_intent_id} for booking ${id}`);
+      } catch (stripeError) {
+        console.error('Error canceling payment intent:', stripeError);
+        // Continue with booking update even if cancel fails (might already be canceled)
+      }
+    }
+
+    // Update booking status
+    booking.status = 'declined';
+    booking.payment_status = 'canceled';
+    if (reason) {
+      booking.decline_reason = reason;
+    }
+    booking.updated_at = new Date().toISOString();
+    bookings.set(id, booking);
+
+    console.log(`✅ Booking ${id} declined by provider`);
+
+    res.json({
+      success: true,
+      data: { booking }
+    });
+  } catch (error) {
+    console.error('Error declining booking:', error);
+    res.status(500).json({
+      success: false,
+      error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to decline booking' }
+    });
+  }
+});
+
+// POST /v1/bookings/:id/cancel - Customer cancels booking
+app.post('/v1/bookings/:id/cancel', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { customerId, reason } = req.body;
+
+    if (!customerId) {
+      return res.status(400).json({
+        success: false,
+        error: { type: 'invalid_request_error', message: 'Missing required field: customerId' }
+      });
+    }
+
+    // Get booking
+    const booking = bookings.get(id);
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        error: { type: 'resource_missing', message: 'Booking not found' }
+      });
+    }
+
+    // Verify customer owns this booking
+    if (booking.customerId !== customerId) {
+      return res.status(403).json({
+        success: false,
+        error: { type: 'permission_denied', message: 'You do not have permission to cancel this booking' }
+      });
+    }
+
+    // Handle cancellation based on current status
+    if (booking.status === 'pending') {
+      // Cancel authorization
+      if (booking.payment_intent_id) {
+        try {
+          await stripe.paymentIntents.cancel(booking.payment_intent_id);
+          console.log(`✅ Canceled PaymentIntent ${booking.payment_intent_id} for booking ${id}`);
+        } catch (stripeError) {
+          console.error('Error canceling payment intent:', stripeError);
+          // Continue with booking update even if cancel fails
+        }
+      }
+
+      booking.status = 'cancelled';
+      booking.payment_status = 'canceled';
+      if (reason) {
+        booking.decline_reason = reason;
+      }
+      booking.updated_at = new Date().toISOString();
+      bookings.set(id, booking);
+
+      console.log(`✅ Booking ${id} cancelled by customer`);
+
+      res.json({
+        success: true,
+        data: { booking }
+      });
+    } else if (booking.status === 'confirmed') {
+      // V1: Disallow cancellation after confirmation
+      // V2: Could implement refund policy here
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: 'invalid_state',
+          message: 'Cannot cancel confirmed booking. Please contact the provider.',
+          currentStatus: booking.status
+        }
+      });
+    } else {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: 'invalid_state',
+          message: `Cannot cancel booking in ${booking.status} status`,
+          currentStatus: booking.status
+        }
+      });
+    }
+  } catch (error) {
+    console.error('Error canceling booking:', error);
+    res.status(500).json({
+      success: false,
+      error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to cancel booking' }
+    });
+  }
 });
 
 app.listen(PORT, () => {
