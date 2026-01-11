@@ -90,8 +90,9 @@ export function createBookingRoutes(
     try {
       const {
         serviceId,
-        requestedDate,
-        requestedTime,
+        date, // YYYY-MM-DD
+        timeStart, // HH:MM:SS or HH:MM
+        timeEnd, // HH:MM:SS or HH:MM (optional if service selected)
         customerEmail,
         customerName
       } = req.body;
@@ -99,31 +100,73 @@ export function createBookingRoutes(
       const customerId = req.user!.id;
 
       // Validate required fields
-      if (!serviceId || !requestedDate || !requestedTime) {
+      if (!date || !timeStart) {
         return res.status(400).json({
           success: false,
-          error: { type: 'invalid_request_error', message: 'Missing required fields: serviceId, requestedDate, requestedTime' }
+          error: { type: 'invalid_request_error', message: 'Missing required fields: date, timeStart' }
         });
       }
 
-      // Validate service exists and is active
-      const service = await db.getService(supabase, serviceId);
-      if (!service) {
-        return res.status(404).json({
-          success: false,
-          error: { type: 'resource_missing', message: 'Service not found' }
-        });
+      let providerId: string;
+      let servicePriceCents: number;
+      let calculatedTimeEnd: string;
+
+      // If service is selected, get service details and calculate end time
+      if (serviceId) {
+        const service = await db.getService(supabase, serviceId);
+        if (!service) {
+          return res.status(404).json({
+            success: false,
+            error: { type: 'resource_missing', message: 'Service not found' }
+          });
+        }
+
+        if (!service.active) {
+          return res.status(400).json({
+            success: false,
+            error: { type: 'invalid_request_error', message: 'Service is not available' }
+          });
+        }
+
+        providerId = service.provider_id;
+        servicePriceCents = service.price_cents;
+
+        // Calculate end time from service duration if not provided
+        if (timeEnd) {
+          calculatedTimeEnd = timeEnd;
+        } else {
+          // Parse time and add duration
+          const [hours, minutes] = timeStart.split(':').map(Number);
+          const startMinutes = hours * 60 + minutes;
+          const endMinutes = startMinutes + service.duration;
+          const endHours = Math.floor(endMinutes / 60);
+          const endMins = endMinutes % 60;
+          calculatedTimeEnd = `${String(endHours).padStart(2, '0')}:${String(endMins).padStart(2, '0')}:00`;
+        }
+      } else {
+        // For custom bookings without service, require providerId, timeEnd, and priceCents
+        const { providerId: customProviderId, priceCents } = req.body;
+        if (!customProviderId || !timeEnd || typeof priceCents !== 'number') {
+          return res.status(400).json({
+            success: false,
+            error: { type: 'invalid_request_error', message: 'For custom bookings: providerId, timeEnd, and priceCents are required' }
+          });
+        }
+        providerId = customProviderId;
+        servicePriceCents = priceCents;
+        calculatedTimeEnd = timeEnd;
       }
 
-      if (!service.active) {
+      // Validate time_end > time_start
+      if (timeStart >= calculatedTimeEnd) {
         return res.status(400).json({
           success: false,
-          error: { type: 'invalid_request_error', message: 'Service is not available' }
+          error: { type: 'invalid_request_error', message: 'End time must be after start time' }
         });
       }
 
       // Validate date/time is in the future
-      const requestedDateTime = new Date(`${requestedDate}T${requestedTime}:00`);
+      const requestedDateTime = new Date(`${date}T${timeStart}`);
       if (requestedDateTime <= new Date()) {
         return res.status(400).json({
           success: false,
@@ -131,9 +174,28 @@ export function createBookingRoutes(
         });
       }
 
-      // Calculate server-side pricing (Model A)
-      const servicePriceCents = service.price_cents;
-      const platformFeeCents = calculateBookingPlatformFee(servicePriceCents);
+      // Check for booking conflicts BEFORE creating payment
+      const hasConflict = await db.checkBookingConflict(
+        supabase,
+        providerId,
+        date,
+        timeStart,
+        calculatedTimeEnd
+      );
+
+      if (hasConflict) {
+        return res.status(409).json({
+          success: false,
+          error: {
+            type: 'booking_conflict',
+            message: 'Time slot already booked'
+          }
+        });
+      }
+
+      // Calculate server-side pricing with platform fee formula
+      // platformFee = max(99, min(round(0.08 * price_after_discount), 1299))
+      const platformFeeCents = Math.max(99, Math.min(Math.round(0.08 * servicePriceCents), 1299));
       const totalChargeCents = servicePriceCents + platformFeeCents;
 
       // Minimum charge validation
@@ -155,9 +217,6 @@ export function createBookingRoutes(
           }
         });
       }
-
-      // Create booking ID
-      const bookingId = uuidv4();
 
       // Create or retrieve Stripe Customer
       let stripeCustomerId: string | undefined;
@@ -181,9 +240,9 @@ export function createBookingRoutes(
 
       // Get provider's connected account ID
       const providerAccountId = await getOrCreateStripeAccountId(
-        service.provider_id,
-        `provider-${service.provider_id}@yardline.app`,
-        `Provider ${service.provider_id}`
+        providerId,
+        `provider-${providerId}@yardline.app`,
+        `Provider ${providerId}`
       );
 
       // Create PaymentIntent with capture_method="manual"
@@ -191,18 +250,17 @@ export function createBookingRoutes(
         amount: totalChargeCents,
         currency: 'usd',
         capture_method: 'manual',
-        description: `YardLine Booking - ${service.name}`,
+        description: `YardLine Booking - ${date} ${timeStart}`,
         metadata: {
-          booking_id: bookingId,
           customer_id: customerId,
-          provider_id: service.provider_id,
-          service_id: serviceId,
-          service_name: service.name,
+          provider_id: providerId,
+          service_id: serviceId || 'custom',
           service_price_cents: String(servicePriceCents),
           platform_fee_cents: String(platformFeeCents),
           total_charge_cents: String(totalChargeCents),
-          requested_date: requestedDate,
-          requested_time: requestedTime,
+          date: date,
+          time_start: timeStart,
+          time_end: calculatedTimeEnd,
           pricing_model: 'model_a',
           review_mode: String(REVIEW_MODE)
         },
@@ -213,7 +271,7 @@ export function createBookingRoutes(
         transfer_data: {
           destination: providerAccountId
         },
-        application_fee_amount: servicePriceCents
+        application_fee_amount: platformFeeCents
       };
 
       if (stripeCustomerId) {
@@ -221,7 +279,7 @@ export function createBookingRoutes(
       }
 
       // Create and confirm payment intent
-      const idempotencyKey = `booking_${customerId}_${serviceId}_${Date.now()}`;
+      const idempotencyKey = `booking_${customerId}_${date}_${timeStart}_${Date.now()}`;
       const paymentIntent = await stripe.paymentIntents.create(paymentIntentParams, { idempotencyKey });
       
       const confirmedPaymentIntent = await stripe.paymentIntents.confirm(paymentIntent.id, {
@@ -229,30 +287,50 @@ export function createBookingRoutes(
       });
 
       // Create booking in database
-      const booking = await db.createBooking(supabase, {
-        bookingId,
-        customerId,
-        providerId: service.provider_id,
-        serviceId,
-        serviceName: service.name,
-        requestedDate,
-        requestedTime,
-        paymentIntentId: paymentIntent.id,
-        amountTotal: totalChargeCents,
-        servicePriceCents,
-        platformFeeCents
-      });
+      try {
+        const booking = await db.createBooking(supabase, {
+          customerId,
+          providerId,
+          serviceId: serviceId || null,
+          date,
+          timeStart,
+          timeEnd: calculatedTimeEnd,
+          paymentIntentId: paymentIntent.id,
+          amountTotal: totalChargeCents,
+          servicePriceCents,
+          platformFeeCents
+        });
 
-      console.log(`✅ Created booking ${bookingId} with payment authorization (PaymentIntent: ${paymentIntent.id})`);
+        console.log(`✅ Created booking ${booking.id} with payment authorization (PaymentIntent: ${paymentIntent.id})`);
 
-      res.json({
-        success: true,
-        data: {
-          booking,
-          paymentIntentClientSecret: confirmedPaymentIntent.client_secret,
-          requiresAction: confirmedPaymentIntent.status === 'requires_action'
+        res.json({
+          success: true,
+          data: {
+            booking,
+            paymentIntentClientSecret: confirmedPaymentIntent.client_secret,
+            requiresAction: confirmedPaymentIntent.status === 'requires_action'
+          }
+        });
+      } catch (dbError: any) {
+        // Handle conflict from database constraint
+        if (dbError.code === 'BOOKING_CONFLICT' || dbError.statusCode === 409) {
+          // Cancel the payment intent since we can't create the booking
+          try {
+            await stripe.paymentIntents.cancel(paymentIntent.id);
+          } catch (stripeError) {
+            console.error('Error canceling payment intent after conflict:', stripeError);
+          }
+          
+          return res.status(409).json({
+            success: false,
+            error: {
+              type: 'booking_conflict',
+              message: 'Time slot already booked'
+            }
+          });
         }
-      });
+        throw dbError;
+      }
     } catch (error: any) {
       console.error('Error creating booking:', error);
       res.status(500).json({
@@ -296,18 +374,18 @@ export function createBookingRoutes(
   // GET /v1/bookings - List bookings
   router.get('/bookings', authenticateUser(supabase), async (req, res) => {
     try {
-      const { customerId, providerId, status } = req.query;
+      const { role, status } = req.query;
       const userId = req.user!.id;
 
-      // User can only view their own bookings
+      // User specifies role: 'customer' or 'provider'
       const filters: any = { status: status as string | undefined };
       
-      if (customerId && customerId === userId) {
-        filters.customerId = customerId as string;
-      } else if (providerId && providerId === userId) {
-        filters.providerId = providerId as string;
+      if (role === 'customer') {
+        filters.customerId = userId;
+      } else if (role === 'provider') {
+        filters.providerId = userId;
       } else {
-        // Default to showing user's bookings as customer
+        // Default to customer bookings if no role specified
         filters.customerId = userId;
       }
 
