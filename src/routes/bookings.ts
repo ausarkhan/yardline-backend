@@ -74,7 +74,8 @@ export function createBookingRoutes(
   router.get('/services', async (req, res) => {
     try {
       const { providerId } = req.query;
-      const services = await db.listServices(supabase, providerId as string | undefined);
+      const providerIdStr = typeof providerId === 'string' ? providerId : undefined;
+      const services = await db.listServices(supabase, providerIdStr);
       res.json({ success: true, data: services });
     } catch (error) {
       console.error('Error listing services:', error);
@@ -378,7 +379,15 @@ export function createBookingRoutes(
       const userId = req.user!.id;
 
       // User specifies role: 'customer' or 'provider'
-      const filters: any = { status: status as string | undefined };
+      const filters: {
+        customerId?: string;
+        providerId?: string;
+        status?: string;
+      } = {};
+
+      if (status && typeof status === 'string') {
+        filters.status = status;
+      }
       
       if (role === 'customer') {
         filters.customerId = userId;

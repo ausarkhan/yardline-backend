@@ -154,8 +154,8 @@ function calculateBookingPlatformFee(servicePriceCents: number): number {
 
 // Database-backed conflict checking is now handled in db.ts
 // This function is kept for backward compatibility but delegates to database
-async function hasConflictingBooking(providerId: string, timeStart: string, timeEnd: string, excludeBookingId?: string): Promise<boolean> {
-  return await db.checkBookingConflict(supabase, providerId, timeStart, timeEnd, excludeBookingId);
+async function hasConflictingBooking(providerId: string, date: string, timeStart: string, timeEnd: string, excludeBookingId?: string): Promise<boolean> {
+  return await db.checkBookingConflict(supabase, providerId, date, timeStart, timeEnd, excludeBookingId);
 }
 
 app.use(cors({
@@ -1394,9 +1394,10 @@ const bookingRouter = createBookingRoutes(
   stripe,
   calculateBookingPlatformFee,
   getOrCreateStripeAccountId,
-  REVIEW_MODE
+  REVIEW_MODE,
+  REVIEW_MODE_MAX_CHARGE_CENTS
 );
-app.use('/v1/bookings', bookingRouter);
+app.use('/v1', bookingRouter);
 
 // OLD IN-MEMORY BOOKING ENDPOINTS (DEPRECATED - COMMENTED OUT)
 // The following endpoints have been replaced by database-backed routes above

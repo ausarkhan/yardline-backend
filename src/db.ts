@@ -125,15 +125,15 @@ export async function createBooking(
     throw new Error('time_end must be greater than time_start');
   }
 
-  const insertData: any = {
+  const insertData = {
     customer_id: bookingData.customerId,
     provider_id: bookingData.providerId,
     service_id: bookingData.serviceId,
     date: bookingData.date,
     time_start: bookingData.timeStart,
     time_end: bookingData.timeEnd,
-    status: 'pending',
-    payment_status: bookingData.paymentIntentId ? 'authorized' : 'none',
+    status: 'pending' as const,
+    payment_status: (bookingData.paymentIntentId ? 'authorized' : 'none') as const,
     payment_intent_id: bookingData.paymentIntentId,
     amount_total: bookingData.amountTotal,
     service_price_cents: bookingData.servicePriceCents,
@@ -230,7 +230,12 @@ export async function updateBookingStatus(
   paymentStatus: DBBooking['payment_status'],
   declineReason?: string
 ): Promise<DBBooking> {
-  const updateData: any = {
+  const updateData: {
+    status: DBBooking['status'];
+    payment_status: DBBooking['payment_status'];
+    updated_at: string;
+    decline_reason?: string;
+  } = {
     status,
     payment_status: paymentStatus,
     updated_at: new Date().toISOString()
