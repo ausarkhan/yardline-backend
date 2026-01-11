@@ -9,8 +9,8 @@ import { Router } from 'express';
 import { SupabaseClient } from '@supabase/supabase-js';
 import Stripe from 'stripe';
 import { v4 as uuidv4 } from 'uuid';
-import * as db from './db';
-import { authenticateUser } from './middleware/auth';
+import * as db from '../db';
+import { authenticateUser } from '../middleware/auth';
 
 export function createBookingRoutes(
   supabase: SupabaseClient,

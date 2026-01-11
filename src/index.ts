@@ -5,6 +5,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { createClient } from '@supabase/supabase-js';
 import * as db from './db';
 import { authenticateUser, optionalAuth } from './middleware/auth';
+import { createBookingRoutes } from './routes/bookings';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1383,6 +1384,23 @@ app.get('/v1/services', (req, res) => {
   }
 });
 
+// ============================================================================
+// BOOKING SYSTEM ENDPOINTS (DATABASE-BACKED)
+// ============================================================================
+
+// Mount the database-backed booking routes
+const bookingRouter = createBookingRoutes(
+  supabase,
+  stripe,
+  calculateBookingPlatformFee,
+  getOrCreateStripeAccountId,
+  REVIEW_MODE
+);
+app.use('/v1/bookings', bookingRouter);
+
+// OLD IN-MEMORY BOOKING ENDPOINTS (DEPRECATED - COMMENTED OUT)
+// The following endpoints have been replaced by database-backed routes above
+/*
 // POST /v1/bookings - Create booking request with payment authorization (customer)
 app.post('/v1/bookings', async (req, res) => {
   try {
@@ -1954,6 +1972,8 @@ app.post('/v1/bookings/:id/cancel', async (req, res) => {
     });
   }
 });
+*/
+// END OF OLD IN-MEMORY BOOKING ENDPOINTS
 
 app.listen(PORT, () => {
   console.log(`YardLine API running on port ${PORT}`);
