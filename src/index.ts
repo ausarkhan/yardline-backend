@@ -6,6 +6,7 @@ import { createClient } from '@supabase/supabase-js';
 import * as db from './db';
 import { authenticateUser, optionalAuth } from './middleware/auth';
 import { createBookingRoutes } from './routes/bookings';
+import { createBookingV1Routes } from './routes/bookings-v1';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -146,10 +147,28 @@ function validateModelAPricing(ticketPriceCents: number, buyerFeeCents: number):
 // BOOKING SYSTEM HELPERS
 // ============================================================================
 
-// Calculate platform fee for bookings (Model A pricing)
+// Calculate platform fee for bookings with Stripe processing fee gross-up
+// This implements the Safe V1 two-step payment fee calculation
+function calcPlatformFeeCents(pCents: number): number {
+  // Get Stripe fee configuration from environment (with defaults)
+  const stripeFeePercent = parseFloat(process.env.STRIPE_FEE_PERCENT || '0.029');
+  const stripeFeeFixedCents = parseInt(process.env.STRIPE_FEE_FIXED_CENTS || '30', 10);
+  
+  // Base platform fee: min $0.99, max $12.99, 8% of service price
+  const baseFeeCents = Math.max(99, Math.min(Math.round(0.08 * pCents), 1299));
+  
+  // Gross up to cover Stripe processing fees
+  // Formula: platformFee = ceil((baseFee + stripePct * price + stripeFixed) / (1 - stripePct))
+  const platformFeeCents = Math.ceil(
+    (baseFeeCents + stripeFeePercent * pCents + stripeFeeFixedCents) / (1 - stripeFeePercent)
+  );
+  
+  return platformFeeCents;
+}
+
+// Legacy function kept for backward compatibility
 function calculateBookingPlatformFee(servicePriceCents: number): number {
-  // Use same Model A formula: buyerFee = (99 + 0.029 * price + 30) / (1 - 0.029)
-  return calculateBuyerFeePerTicket(servicePriceCents);
+  return calcPlatformFeeCents(servicePriceCents);
 }
 
 // Database-backed conflict checking is now handled in db.ts
@@ -1401,6 +1420,14 @@ const bookingRouter = createBookingRoutes(
   REVIEW_MODE_MAX_CHARGE_CENTS
 );
 app.use('/v1', bookingRouter);
+
+// Mount Safe V1 Two-Step Payment routes
+const bookingV1Router = createBookingV1Routes(
+  supabase,
+  stripe,
+  calcPlatformFeeCents
+);
+app.use('/v1/bookings', bookingV1Router);
 
 // OLD IN-MEMORY BOOKING ENDPOINTS (DEPRECATED - COMMENTED OUT)
 // The following endpoints have been replaced by database-backed routes above
