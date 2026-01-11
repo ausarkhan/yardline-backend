@@ -1302,9 +1302,10 @@ app.get('/v1/tickets/by-session/:sessionId', (req, res) => {
 });
 
 // ============================================================================
-// BOOKING SYSTEM ENDPOINTS
+// OLD IN-MEMORY SERVICE ENDPOINTS (DEPRECATED - COMMENTED OUT)
+// These have been replaced by database-backed routes in bookingRouter
 // ============================================================================
-
+/*
 // POST /v1/services - Create a service (provider only)
 app.post('/v1/services', (req, res) => {
   try {
@@ -1383,6 +1384,8 @@ app.get('/v1/services', (req, res) => {
     });
   }
 });
+*/
+// END OF OLD IN-MEMORY SERVICE ENDPOINTS
 
 // ============================================================================
 // BOOKING SYSTEM ENDPOINTS (DATABASE-BACKED)

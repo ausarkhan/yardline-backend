@@ -58,7 +58,7 @@ export async function createService(
       active: true
     })
     .select()
-    .single();
+    .single<DBService>();
 
   if (error) throw error;
   return data;
@@ -72,7 +72,7 @@ export async function getService(
     .from('services')
     .select('*')
     .eq('service_id', serviceId)
-    .single();
+    .single<DBService>();
 
   if (error) {
     if (error.code === 'PGRST116') return null; // Not found
@@ -93,7 +93,7 @@ export async function listServices(
   
   query = query.eq('active', true);
   
-  const { data, error } = await query;
+  const { data, error } = await query.returns<DBService[]>();
   
   if (error) throw error;
   return data || [];
@@ -125,15 +125,28 @@ export async function createBooking(
     throw new Error('time_end must be greater than time_start');
   }
 
-  const insertData = {
+  const insertData: {
+    customer_id: string;
+    provider_id: string;
+    service_id: string | null;
+    date: string;
+    time_start: string;
+    time_end: string;
+    status: 'pending';
+    payment_status: 'authorized' | 'none';
+    payment_intent_id: string | null;
+    amount_total: number | null;
+    service_price_cents: number | null;
+    platform_fee_cents: number | null;
+  } = {
     customer_id: bookingData.customerId,
     provider_id: bookingData.providerId,
     service_id: bookingData.serviceId,
     date: bookingData.date,
     time_start: bookingData.timeStart,
     time_end: bookingData.timeEnd,
-    status: 'pending' as const,
-    payment_status: (bookingData.paymentIntentId ? 'authorized' : 'none') as const,
+    status: 'pending',
+    payment_status: bookingData.paymentIntentId ? 'authorized' : 'none',
     payment_intent_id: bookingData.paymentIntentId,
     amount_total: bookingData.amountTotal,
     service_price_cents: bookingData.servicePriceCents,
@@ -144,7 +157,7 @@ export async function createBooking(
     .from('bookings')
     .insert(insertData)
     .select()
-    .single();
+    .single<DBBooking>();
 
   if (error) {
     // Handle exclusion constraint violation
@@ -167,7 +180,7 @@ export async function getBooking(
     .from('bookings')
     .select('*')
     .eq('id', bookingId)
-    .single();
+    .single<DBBooking>();
 
   if (error) {
     if (error.code === 'PGRST116') return null; // Not found
@@ -184,7 +197,7 @@ export async function getBookingByPaymentIntent(
     .from('bookings')
     .select('*')
     .eq('payment_intent_id', paymentIntentId)
-    .single();
+    .single<DBBooking>();
 
   if (error) {
     if (error.code === 'PGRST116') return null; // Not found
@@ -217,7 +230,7 @@ export async function listBookings(
   
   query = query.order('created_at', { ascending: false });
   
-  const { data, error } = await query;
+  const { data, error } = await query.returns<DBBooking[]>();
   
   if (error) throw error;
   return data || [];
@@ -250,7 +263,7 @@ export async function updateBookingStatus(
     .update(updateData)
     .eq('id', bookingId)
     .select()
-    .single();
+    .single<DBBooking>();
 
   if (error) {
     // Handle exclusion constraint violation on update
@@ -278,7 +291,7 @@ export async function updateBookingPaymentStatus(
     })
     .eq('id', bookingId)
     .select()
-    .single();
+    .single<DBBooking>();
 
   if (error) throw error;
   return data;
