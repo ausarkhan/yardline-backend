@@ -121,16 +121,15 @@ export function createBookingV1Routes(
       // Create idempotency key for deposit payment
       const idempotencyKey = `booking_request:${customerId}:${service_id}:${date}:${time_start}-${time_end}`;
 
-      // Create and confirm Stripe PaymentIntent for platform fee deposit ONLY
+      // Create Stripe PaymentIntent for platform fee deposit (NOT confirmed yet)
+      // Client will confirm via PaymentSheet with card/Apple Pay
       let paymentIntent: Stripe.PaymentIntent;
       try {
         paymentIntent = await stripe.paymentIntents.create({
           amount: platformFeeCents,
           currency: 'usd',
-          confirm: true, // Auto-confirm for immediate charge
           automatic_payment_methods: {
-            enabled: true,
-            allow_redirects: 'never' // Prevent redirect-based payment methods
+            enabled: true
           },
           metadata: {
             type: 'deposit',
@@ -146,20 +145,117 @@ export function createBookingV1Routes(
           idempotencyKey
         });
       } catch (stripeError: any) {
-        console.error('Stripe deposit payment failed:', stripeError);
+        console.error('Stripe PaymentIntent creation failed:', stripeError);
         return res.status(400).json({
-          error: stripeError.message || 'Payment failed',
-          code: stripeError.code || 'payment_failed',
+          error: stripeError.message || 'PaymentIntent creation failed',
+          code: stripeError.code || 'payment_intent_failed',
           type: 'stripe_error'
+        });
+      }
+
+      // Return booking draft with PaymentIntent client_secret
+      // Client will collect payment via PaymentSheet, then call /confirm-deposit
+      res.json({
+        bookingDraft: {
+          service_id,
+          provider_id,
+          date,
+          time_start,
+          time_end,
+          service_price_cents: servicePriceCents,
+          platform_fee_cents: platformFeeCents
+        },
+        paymentIntentClientSecret: paymentIntent.client_secret,
+        paymentIntentId: paymentIntent.id
+      });
+    } catch (error) {
+      console.error('Error in /v1/bookings/request:', error);
+      res.status(500).json({
+        error: error instanceof Error ? error.message : 'Internal server error',
+        code: 'api_error'
+      });
+    }
+  });
+
+  // ============================================================================
+  // POST /v1/bookings/confirm-deposit - Confirm booking after PaymentSheet success
+  // ============================================================================
+  router.post('/confirm-deposit', authenticateUser(supabase), async (req: Request, res: Response) => {
+    try {
+      const {
+        payment_intent_id,
+        service_id,
+        provider_id,
+        date,
+        time_start,
+        time_end,
+        service_price_cents,
+        platform_fee_cents
+      } = req.body;
+
+      const customerId = req.user!.id;
+
+      // Validate required fields
+      if (!payment_intent_id || !service_id || !provider_id || !date || !time_start || !time_end) {
+        return res.status(400).json({
+          error: 'Missing required fields',
+          code: 'invalid_request_error'
+        });
+      }
+
+      if (!service_price_cents || !platform_fee_cents) {
+        return res.status(400).json({
+          error: 'Missing pricing fields',
+          code: 'invalid_request_error'
+        });
+      }
+
+      // Verify PaymentIntent status with Stripe
+      let paymentIntent: Stripe.PaymentIntent;
+      try {
+        paymentIntent = await stripe.paymentIntents.retrieve(payment_intent_id);
+      } catch (stripeError: any) {
+        console.error('Failed to retrieve PaymentIntent:', stripeError);
+        return res.status(400).json({
+          error: 'Invalid payment_intent_id',
+          code: 'invalid_payment_intent'
         });
       }
 
       // Verify payment succeeded
       if (paymentIntent.status !== 'succeeded') {
         return res.status(400).json({
-          error: `Payment status is ${paymentIntent.status}`,
+          error: `Payment not succeeded. Status: ${paymentIntent.status}`,
           code: 'payment_not_succeeded',
           stripe_status: paymentIntent.status
+        });
+      }
+
+      // Verify payment metadata matches booking data
+      const metadata = paymentIntent.metadata;
+      if (metadata.customer_id !== customerId ||
+          metadata.service_id !== service_id ||
+          metadata.provider_id !== provider_id) {
+        return res.status(400).json({
+          error: 'PaymentIntent metadata mismatch',
+          code: 'metadata_mismatch'
+        });
+      }
+
+      // Check for time slot conflicts again before creating booking
+      const hasConflict = await db.checkBookingConflict(
+        supabase,
+        provider_id,
+        date,
+        time_start,
+        time_end
+      );
+
+      if (hasConflict) {
+        return res.status(409).json({
+          error: 'Time already booked',
+          code: 'booking_conflict',
+          message: 'Time slot no longer available'
         });
       }
 
@@ -173,28 +269,24 @@ export function createBookingV1Routes(
           date,
           timeStart: time_start,
           timeEnd: time_end,
-          servicePriceCents,
-          platformFeeCents,
+          servicePriceCents: service_price_cents,
+          platformFeeCents: platform_fee_cents,
           depositPaymentIntentId: paymentIntent.id
         });
       } catch (dbError: any) {
-        // If booking creation fails after payment, we need to handle this carefully
-        // In production, you'd want to refund or log this for manual review
-        console.error('Booking creation failed after payment:', dbError);
+        console.error('Booking creation failed after payment confirmed:', dbError);
         
         if (dbError.code === 'BOOKING_CONFLICT') {
           return res.status(409).json({
             error: 'Time already booked',
             code: 'booking_conflict',
-            message: 'Time already booked',
-            payment_intent_id: paymentIntent.id // Include PI ID for potential refund
+            message: 'Time already booked'
           });
         }
         
         return res.status(500).json({
-          error: 'Failed to create booking after payment',
-          code: 'booking_creation_failed',
-          payment_intent_id: paymentIntent.id // Include PI ID for potential refund
+          error: 'Failed to create booking',
+          code: 'booking_creation_failed'
         });
       }
 
@@ -214,16 +306,16 @@ export function createBookingV1Routes(
           created_at: booking.created_at
         },
         pricing: {
-          service_price_cents: servicePriceCents,
-          platform_fee_cents: platformFeeCents,
-          deposit_cents: platformFeeCents
+          service_price_cents: service_price_cents,
+          platform_fee_cents: platform_fee_cents,
+          deposit_cents: platform_fee_cents
         },
         stripe: {
           deposit_payment_intent_id: paymentIntent.id
         }
       });
     } catch (error) {
-      console.error('Error in /v1/bookings/request:', error);
+      console.error('Error in /v1/bookings/confirm-deposit:', error);
       res.status(500).json({
         error: error instanceof Error ? error.message : 'Internal server error',
         code: 'api_error'
