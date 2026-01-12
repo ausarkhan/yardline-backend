@@ -694,12 +694,57 @@ app.post(
 // Apply JSON body parsing to all other routes
 app.use(express.json());
 
+// ============================================================================
+// PAYMENT INTENT HELPER
+// ============================================================================
+async function createPaymentIntent(params: {
+  amount: number;
+  currency?: string;
+  metadata?: Record<string, string>;
+}): Promise<{ clientSecret: string }> {
+  const { amount, currency = 'usd', metadata = {} } = params;
+
+  const paymentIntent = await stripe.paymentIntents.create({
+    amount,
+    currency,
+    metadata,
+    automatic_payment_methods: { enabled: true },
+  });
+
+  return { clientSecret: paymentIntent.client_secret! };
+}
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'yardline-api', version: '1.0.0' });
 });
 
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+app.post('/v1/stripe/payment-intent', async (req, res) => {
+  try {
+    console.log('💳 PaymentIntent endpoint hit');
+
+    const { amount, currency = 'usd', metadata } = req.body;
+
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Invalid amount' });
+    }
+
+    const result = await createPaymentIntent({
+      amount,
+      currency,
+      metadata,
+    });
+
+    return res.json({
+      clientSecret: result.clientSecret,
+    });
+  } catch (err: any) {
+    console.error('❌ PaymentIntent error:', err.message);
+    return res.status(500).json({ error: 'Payment initialization failed' });
+  }
 });
 
 app.get('/v1/stripe/mode', (req, res) => {
