@@ -1254,42 +1254,122 @@ app.post('/v1/payments/create-intent', async (req, res) => {
   }
 });
 
-// Legacy endpoint - kept for backward compatibility but uses Model A pricing
+// Unified payment intent endpoint - handles both simple and complex formats
 app.post('/v1/stripe/payment-intents', async (req, res) => {
   try {
-    const { connectedAccountId, items, ticketSubtotalCents, platformFeeTotalCents, buyerFeeTotalCents, totalChargeCents, description, metadata, idempotencyKey } = req.body;
-    if (totalChargeCents < 50) {
-      return res.status(400).json({ success: false, error: { type: 'invalid_request_error', message: 'Amount must be at least $0.50 USD', code: 'amount_too_small' } });
-    }
+    console.log("💳 HIT /v1/stripe/payment-intents", req.body);
     
-    // Use buyerFeeTotalCents if provided, otherwise fall back to platformFeeTotalCents for backward compatibility
-    const feeTotalCents = buyerFeeTotalCents || platformFeeTotalCents;
+    const { 
+      amount, 
+      currency, 
+      description, 
+      metadata,
+      // Legacy format fields
+      connectedAccountId, 
+      items, 
+      ticketSubtotalCents, 
+      platformFeeTotalCents, 
+      buyerFeeTotalCents, 
+      totalChargeCents, 
+      idempotencyKey 
+    } = req.body;
+
+    // Determine if this is simple or complex format
+    const isSimpleFormat = amount !== undefined && totalChargeCents === undefined;
     
-    const paymentIntentParams: Stripe.PaymentIntentCreateParams = {
-      amount: totalChargeCents,
-      currency: 'usd',
-      description: description || 'YardLine Ticket Purchase',
-      metadata: { 
-        ...metadata, 
-        items_json: JSON.stringify(items), 
-        ticket_subtotal_cents: String(ticketSubtotalCents), 
-        buyer_fee_total_cents: String(feeTotalCents),
-        platform_fee_total_cents: String(feeTotalCents), // Legacy field
-        total_charge_cents: String(totalChargeCents),
-        pricing_model: 'model_a'
-      },
-      automatic_payment_methods: { enabled: true },
-    };
-    if (connectedAccountId) {
-      paymentIntentParams.transfer_data = { destination: connectedAccountId };
-      // Model A: Host receives full ticket price
-      paymentIntentParams.application_fee_amount = ticketSubtotalCents;
-      paymentIntentParams.metadata!.connected_account = connectedAccountId;
+    if (isSimpleFormat) {
+      // Simple format: { amount, currency?, description?, metadata? }
+      
+      // Validate amount is an integer in cents and > 0
+      if (!amount || typeof amount !== 'number' || !Number.isInteger(amount) || amount <= 0) {
+        console.error('❌ Invalid amount:', amount);
+        return res.status(400).json({ 
+          error: 'Invalid amount - must be an integer in cents greater than 0' 
+        });
+      }
+
+      const paymentIntentParams: Stripe.PaymentIntentCreateParams = {
+        amount,
+        currency: currency || 'usd',
+        description: description || 'YardLine Payment',
+        metadata: metadata || {},
+        automatic_payment_methods: { enabled: true },
+      };
+
+      const paymentIntent = await stripe.paymentIntents.create(paymentIntentParams);
+      
+      console.log(`✅ PI created: ${paymentIntent.id}`);
+      
+      return res.json({
+        paymentIntentId: paymentIntent.id,
+        clientSecret: paymentIntent.client_secret,
+        amount: paymentIntent.amount,
+        currency: paymentIntent.currency,
+        status: paymentIntent.status,
+      });
+    } else {
+      // Legacy complex format for booking system
+      if (totalChargeCents < 50) {
+        return res.status(400).json({ 
+          success: false, 
+          error: { 
+            type: 'invalid_request_error', 
+            message: 'Amount must be at least $0.50 USD', 
+            code: 'amount_too_small' 
+          } 
+        });
+      }
+      
+      // Use buyerFeeTotalCents if provided, otherwise fall back to platformFeeTotalCents
+      const feeTotalCents = buyerFeeTotalCents || platformFeeTotalCents;
+      
+      const paymentIntentParams: Stripe.PaymentIntentCreateParams = {
+        amount: totalChargeCents,
+        currency: 'usd',
+        description: description || 'YardLine Ticket Purchase',
+        metadata: { 
+          ...metadata, 
+          items_json: JSON.stringify(items), 
+          ticket_subtotal_cents: String(ticketSubtotalCents), 
+          buyer_fee_total_cents: String(feeTotalCents),
+          platform_fee_total_cents: String(feeTotalCents),
+          total_charge_cents: String(totalChargeCents),
+          pricing_model: 'model_a'
+        },
+        automatic_payment_methods: { enabled: true },
+      };
+      
+      if (connectedAccountId) {
+        paymentIntentParams.transfer_data = { destination: connectedAccountId };
+        paymentIntentParams.application_fee_amount = ticketSubtotalCents;
+        paymentIntentParams.metadata!.connected_account = connectedAccountId;
+      }
+      
+      const paymentIntent = await stripe.paymentIntents.create(
+        paymentIntentParams, 
+        idempotencyKey ? { idempotencyKey } : undefined
+      );
+      
+      console.log(`✅ PI created: ${paymentIntent.id}`);
+      
+      return res.json({ 
+        success: true, 
+        data: { 
+          paymentIntentId: paymentIntent.id, 
+          clientSecret: paymentIntent.client_secret, 
+          amount: paymentIntent.amount, 
+          currency: paymentIntent.currency, 
+          status: paymentIntent.status 
+        } 
+      });
     }
-    const paymentIntent = await stripe.paymentIntents.create(paymentIntentParams, idempotencyKey ? { idempotencyKey } : undefined);
-    res.json({ success: true, data: { paymentIntentId: paymentIntent.id, clientSecret: paymentIntent.client_secret, amount: paymentIntent.amount, currency: paymentIntent.currency, status: paymentIntent.status } });
   } catch (error) {
-    res.status(500).json({ success: false, error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to create payment intent' } });
+    const errorMessage = error instanceof Error ? error.message : 'Payment initialization failed';
+    console.error('❌ Stripe PaymentIntent error:', errorMessage);
+    
+    return res.status(500).json({ 
+      error: 'Payment initialization failed'
+    });
   }
 });
 
