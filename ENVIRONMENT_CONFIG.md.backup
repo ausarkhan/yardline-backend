@@ -1,24 +1,8 @@
-# Production Stripe Configuration (LIVE-ONLY)
+# Environment-Based Stripe Configuration
 
-## ⚠️ BREAKING CHANGE - January 2026
+## Overview
 
-**The backend now enforces LIVE Stripe only. All test mode logic has been removed for production safety.**
-
-See [PRODUCTION_STRIPE_CONFIG.md](./PRODUCTION_STRIPE_CONFIG.md) for detailed documentation.
-
----
-
-## Required Configuration
-
-```bash
-# REQUIRED: Stripe Live Secret Key
-export STRIPE_LIVE_SECRET_KEY=sk_live_xxxxxxxxxxxxxxxxxxxxx
-
-# RECOMMENDED: Webhook Secret
-export STRIPE_LIVE_WEBHOOK_SECRET=whsec_xxxxxxxxxxxxxxxxxxxxx
-```
-
-**The server will crash on startup if `STRIPE_LIVE_SECRET_KEY` is missing or doesn't start with `sk_live_`.**
+The backend now supports **environment-based Stripe key selection** via the `STRIPE_ENV` variable. This allows you to configure both test and live credentials simultaneously and switch between them easily.
 
 ---
 

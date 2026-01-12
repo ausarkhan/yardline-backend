@@ -219,23 +219,43 @@ export function createBookingRoutes(
         });
       }
 
+      // Validate amount > 0 (production safety)
+      if (totalChargeCents <= 0) {
+        console.error(`❌ Invalid total charge: ${totalChargeCents} cents`);
+        return res.status(400).json({
+          error: 'Total charge must be greater than 0',
+          code: 'invalid_amount'
+        });
+      }
+
       // Create or retrieve Stripe Customer
+      console.log(`Looking up or creating Stripe customer for email: ${customerEmail}`);
       let stripeCustomerId: string | undefined;
       if (customerEmail) {
-        const customers = await stripe.customers.list({
-          email: customerEmail,
-          limit: 1
-        });
-
-        if (customers.data.length > 0) {
-          stripeCustomerId = customers.data[0].id;
-        } else {
-          const customer = await stripe.customers.create({
+        try {
+          const customers = await stripe.customers.list({
             email: customerEmail,
-            name: customerName,
-            metadata: { customerId }
+            limit: 1
           });
-          stripeCustomerId = customer.id;
+
+          if (customers.data.length > 0) {
+            stripeCustomerId = customers.data[0].id;
+            console.log(`✅ Found existing Stripe customer: ${stripeCustomerId}`);
+          } else {
+            const customer = await stripe.customers.create({
+              email: customerEmail,
+              name: customerName,
+              metadata: { customerId }
+            });
+            stripeCustomerId = customer.id;
+            console.log(`✅ Created new Stripe customer: ${stripeCustomerId}`);
+          }
+        } catch (stripeError: any) {
+          console.error(`❌ Failed to create/retrieve Stripe customer:`, {
+            error: stripeError.message,
+            code: stripeError.code
+          });
+          throw stripeError;
         }
       }
 
@@ -247,9 +267,10 @@ export function createBookingRoutes(
       );
 
       // Create PaymentIntent with capture_method="manual"
+      console.log(`Creating PaymentIntent: amount=${totalChargeCents} cents, provider=${providerAccountId}`);
       const paymentIntentParams: Stripe.PaymentIntentCreateParams = {
         amount: totalChargeCents,
-        currency: 'usd',
+        currency: 'usd', // Enforce USD only
         capture_method: 'manual',
         description: `YardLine Booking - ${date} ${timeStart}`,
         metadata: {
@@ -281,11 +302,33 @@ export function createBookingRoutes(
 
       // Create and confirm payment intent
       const idempotencyKey = `booking_${customerId}_${date}_${timeStart}_${Date.now()}`;
-      const paymentIntent = await stripe.paymentIntents.create(paymentIntentParams, { idempotencyKey });
+      let paymentIntent: Stripe.PaymentIntent;
+      let confirmedPaymentIntent: Stripe.PaymentIntent;
       
-      const confirmedPaymentIntent = await stripe.paymentIntents.confirm(paymentIntent.id, {
-        return_url: 'https://yardline.app/bookings/return'
-      });
+      try {
+        paymentIntent = await stripe.paymentIntents.create(paymentIntentParams, { idempotencyKey });
+        console.log(`✅ PaymentIntent created: ${paymentIntent.id}, status=${paymentIntent.status}`);
+
+        // Production safety: always return client_secret
+        if (!paymentIntent.client_secret) {
+          console.error(`❌ PaymentIntent ${paymentIntent.id} missing client_secret`);
+          throw new Error('PaymentIntent created but client_secret is missing');
+        }
+
+        confirmedPaymentIntent = await stripe.paymentIntents.confirm(paymentIntent.id, {
+          return_url: 'https://yardline.app/bookings/return'
+        });
+        console.log(`✅ PaymentIntent confirmed: ${confirmedPaymentIntent.id}, status=${confirmedPaymentIntent.status}`);
+      } catch (stripeError: any) {
+        // Log and rethrow Stripe API errors
+        console.error(`❌ Stripe PaymentIntent creation/confirmation failed:`, {
+          error: stripeError.message,
+          code: stripeError.code,
+          type: stripeError.type,
+          amount: totalChargeCents
+        });
+        throw stripeError;
+      }
 
       // Create booking in database
       try {
@@ -316,10 +359,15 @@ export function createBookingRoutes(
         // Handle conflict from database constraint
         if (dbError.code === 'BOOKING_CONFLICT' || dbError.statusCode === 409) {
           // Cancel the payment intent since we can't create the booking
+          console.log(`Canceling PaymentIntent ${paymentIntent.id} due to booking conflict`);
           try {
             await stripe.paymentIntents.cancel(paymentIntent.id);
-          } catch (stripeError) {
-            console.error('Error canceling payment intent after conflict:', stripeError);
+            console.log(`✅ PaymentIntent ${paymentIntent.id} canceled successfully`);
+          } catch (stripeError: any) {
+            console.error(`❌ Error canceling PaymentIntent ${paymentIntent.id}:`, {
+              error: stripeError.message,
+              code: stripeError.code
+            });
           }
           
           return res.status(409).json({
@@ -454,6 +502,7 @@ export function createBookingRoutes(
       }
 
       // Capture the PaymentIntent
+      console.log(`Capturing payment for booking ${id}, PaymentIntent: ${booking.payment_intent_id}`);
       try {
         const captureIdempotencyKey = `capture_${id}`;
         const capturedPaymentIntent = await stripe.paymentIntents.capture(
@@ -462,7 +511,7 @@ export function createBookingRoutes(
           { idempotencyKey: captureIdempotencyKey }
         );
 
-        console.log(`✅ Booking ${id} accepted and payment captured`);
+        console.log(`✅ Booking ${id} accepted and payment captured: ${capturedPaymentIntent.id}, status=${capturedPaymentIntent.status}`);
 
         res.json({
           success: true,
@@ -472,7 +521,12 @@ export function createBookingRoutes(
           }
         });
       } catch (stripeError: any) {
-        console.error('Error capturing payment:', stripeError);
+        console.error(`❌ Error capturing payment for booking ${id}:`, {
+          error: stripeError.message,
+          code: stripeError.code,
+          type: stripeError.type,
+          paymentIntent: booking.payment_intent_id
+        });
 
         // Handle authorization expiry
         if (stripeError.code === 'charge_expired_for_capture') {
@@ -546,9 +600,15 @@ export function createBookingRoutes(
 
       // Cancel the PaymentIntent
       if (booking.payment_intent_id) {
+        console.log(`Canceling PaymentIntent ${booking.payment_intent_id} for declined booking ${id}`);
         try {
           await stripe.paymentIntents.cancel(booking.payment_intent_id);
-        } catch (stripeError) {
+          console.log(`✅ PaymentIntent ${booking.payment_intent_id} canceled successfully`);
+        } catch (stripeError: any) {
+          console.error(`❌ Error canceling PaymentIntent ${booking.payment_intent_id}:`, {
+            error: stripeError.message,
+            code: stripeError.code
+          });
           console.error('Error canceling payment intent:', stripeError);
         }
       }

@@ -27,69 +27,61 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   }
 });
 
-// Environment-based Stripe configuration
-// Supports two modes:
-// 1. Explicit environment selection via STRIPE_ENV (test/live)
-// 2. Legacy: Auto-detect from STRIPE_SECRET_KEY prefix
-const STRIPE_ENV = process.env.STRIPE_ENV as 'test' | 'live' | undefined;
+// ============================================================================
+// STRIPE LIVE-ONLY CONFIGURATION (PRODUCTION SAFETY)
+// ============================================================================
+// This backend enforces LIVE Stripe only. No test keys, no fallbacks.
+// If misconfigured, the server will crash on startup with a clear error.
+// ============================================================================
 
-// Environment-specific keys
-const STRIPE_TEST_SECRET_KEY = process.env.STRIPE_TEST_SECRET_KEY;
 const STRIPE_LIVE_SECRET_KEY = process.env.STRIPE_LIVE_SECRET_KEY;
-const STRIPE_TEST_WEBHOOK_SECRET = process.env.STRIPE_TEST_WEBHOOK_SECRET;
 const STRIPE_LIVE_WEBHOOK_SECRET = process.env.STRIPE_LIVE_WEBHOOK_SECRET;
 
-// Legacy single key support (backward compatible)
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
-
-// Determine which Stripe key to use
-function getStripeSecretKey(): string {
-  if (STRIPE_ENV) {
-    // Explicit environment mode
-    const key = STRIPE_ENV === 'test' ? STRIPE_TEST_SECRET_KEY : STRIPE_LIVE_SECRET_KEY;
-    if (!key) {
-      throw new Error(`STRIPE_ENV is set to "${STRIPE_ENV}" but STRIPE_${STRIPE_ENV.toUpperCase()}_SECRET_KEY is not configured`);
-    }
-    return key;
-  } else if (STRIPE_SECRET_KEY) {
-    // Legacy mode - single key
-    return STRIPE_SECRET_KEY;
-  } else {
-    throw new Error('No Stripe secret key configured. Set STRIPE_ENV + STRIPE_TEST_SECRET_KEY/STRIPE_LIVE_SECRET_KEY, or STRIPE_SECRET_KEY');
+// Validate and get Stripe LIVE secret key - fail fast if misconfigured
+function getStripeLiveSecretKey(): string {
+  const key = STRIPE_LIVE_SECRET_KEY;
+  
+  if (!key) {
+    console.error('❌ FATAL: STRIPE_LIVE_SECRET_KEY is not configured');
+    console.error('❌ PRODUCTION REQUIRES: STRIPE_LIVE_SECRET_KEY=sk_live_...');
+    throw new Error('STRIPE_LIVE_SECRET_KEY is required for production. Server cannot start.');
   }
+  
+  // Validate key prefix to ensure it's a LIVE key
+  if (!key.startsWith('sk_live_')) {
+    console.error('❌ FATAL: STRIPE_LIVE_SECRET_KEY must start with sk_live_');
+    console.error(`❌ CURRENT KEY PREFIX: ${key.substring(0, 8)}...`);
+    console.error('❌ REFUSING TO START WITH NON-LIVE STRIPE KEY');
+    throw new Error('Invalid Stripe key: must be a LIVE key (sk_live_). Server cannot start.');
+  }
+  
+  console.log('✅ Stripe LIVE mode validated: key prefix verified');
+  return key;
 }
 
-// Determine which webhook secret to use
+// Get webhook secret (optional but recommended)
 function getWebhookSecret(): string | undefined {
-  if (STRIPE_ENV) {
-    // Explicit environment mode
-    return STRIPE_ENV === 'test' ? STRIPE_TEST_WEBHOOK_SECRET : STRIPE_LIVE_WEBHOOK_SECRET;
+  if (STRIPE_LIVE_WEBHOOK_SECRET) {
+    console.log('✅ Stripe webhook secret configured');
   } else {
-    // Legacy mode
-    return STRIPE_WEBHOOK_SECRET;
+    console.warn('⚠️  WARNING: STRIPE_LIVE_WEBHOOK_SECRET not configured - webhook signature validation disabled');
   }
+  return STRIPE_LIVE_WEBHOOK_SECRET;
 }
 
-// Detect Stripe mode
-function getStripeMode(): 'test' | 'live' {
-  if (STRIPE_ENV) {
-    return STRIPE_ENV;
-  }
-  // Legacy: auto-detect from key prefix
-  const key = STRIPE_SECRET_KEY;
-  if (key?.startsWith('sk_test_')) return 'test';
-  if (key?.startsWith('sk_live_')) return 'live';
-  return 'test'; // default to test mode
+// Initialize Stripe with LIVE key only - fail fast on error
+let stripe: Stripe;
+try {
+  const liveKey = getStripeLiveSecretKey();
+  stripe = new Stripe(liveKey, {
+    apiVersion: '2024-11-20.acacia' as any,
+  });
+  console.log('✅ Stripe client initialized in LIVE mode');
+} catch (error) {
+  console.error('❌ FATAL: Failed to initialize Stripe client');
+  console.error('❌ ERROR:', error instanceof Error ? error.message : String(error));
+  throw error; // Crash the server - do not continue with misconfigured Stripe
 }
-
-const isTestMode = getStripeMode() === 'test';
-const isLiveMode = getStripeMode() === 'live';
-
-// Initialize Stripe with the appropriate key
-const stripe = new Stripe(getStripeSecretKey(), {
-  apiVersion: '2024-11-20.acacia' as any,
-});
 
 // Review-safe mode - prevents real charges during App Store review
 const REVIEW_MODE = process.env.REVIEW_MODE === 'true';
@@ -252,52 +244,51 @@ const processedWebhookEvents: Set<string> = new Set(); // Track processed webhoo
 
 // Note: Bookings and Services are now stored in Supabase database, not in-memory
 
-// User records structure to track both test and live Stripe account IDs
+// User records structure to track Stripe account IDs (LIVE only)
 interface UserStripeAccounts {
   userId: string;
-  testStripeAccountId?: string;
   liveStripeAccountId?: string;
 }
 
 const userStripeAccounts: Map<string, UserStripeAccounts> = new Map();
 
-// Helper function to get or create the appropriate Stripe account ID based on mode
+// Helper function to get or create Stripe Connect account (LIVE mode only)
 async function getOrCreateStripeAccountId(userId: string, email: string, name: string): Promise<string> {
-  const mode = getStripeMode();
-  
-  // Get or initialize user's Stripe accounts
+  // Get or initialize user's Stripe account
   let userAccounts = userStripeAccounts.get(userId);
   if (!userAccounts) {
     userAccounts = { userId };
     userStripeAccounts.set(userId, userAccounts);
   }
 
-  // Check if we already have an account ID for this mode
-  const existingAccountId = mode === 'test' ? userAccounts.testStripeAccountId : userAccounts.liveStripeAccountId;
-  if (existingAccountId) {
-    return existingAccountId;
+  // Check if we already have a LIVE account ID
+  if (userAccounts.liveStripeAccountId) {
+    return userAccounts.liveStripeAccountId;
   }
 
-  // Create a new Stripe Express account in the appropriate mode
-  const account = await stripe.accounts.create({
-    type: 'express',
-    email,
-    capabilities: {
-      card_payments: { requested: true },
-      transfers: { requested: true },
-    },
-    business_profile: { name },
-  });
+  // Create a new Stripe Express account in LIVE mode
+  console.log(`Creating Stripe Connect account for user ${userId} (LIVE mode)`);
+  try {
+    const account = await stripe.accounts.create({
+      type: 'express',
+      email,
+      capabilities: {
+        card_payments: { requested: true },
+        transfers: { requested: true },
+      },
+      business_profile: { name },
+    });
 
-  // Store the account ID for this mode
-  if (mode === 'test') {
-    userAccounts.testStripeAccountId = account.id;
-  } else {
+    // Store the LIVE account ID
     userAccounts.liveStripeAccountId = account.id;
+    userStripeAccounts.set(userId, userAccounts);
+    
+    console.log(`✅ Created Stripe Connect account: ${account.id} for user ${userId}`);
+    return account.id;
+  } catch (error) {
+    console.error(`❌ Failed to create Stripe Connect account for user ${userId}:`, error);
+    throw error;
   }
-  userStripeAccounts.set(userId, userAccounts);
-
-  return account.id;
 }
 
 // Handler function for checkout session completed webhook events
@@ -612,7 +603,7 @@ app.post(
       console.log('✅ Webhook signature verified successfully');
       console.log('Event type:', event.type);
       console.log('Event ID:', event.id);
-      console.log('Mode:', getStripeMode());
+      console.log('Mode: LIVE');
     } catch (err) {
       // Signature verification failed - log detailed error
       console.error('❌ Webhook signature verification failed');
@@ -713,18 +704,16 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/v1/stripe/mode', (req, res) => {
-  const mode = getStripeMode();
   res.json({ 
     success: true, 
     data: { 
-      mode, 
-      isTestMode, 
-      isLiveMode,
+      mode: 'live',
+      isTestMode: false,
+      isLiveMode: true,
       reviewMode: REVIEW_MODE,
       reviewModeMaxChargeCents: REVIEW_MODE ? REVIEW_MODE_MAX_CHARGE_CENTS : null,
-      envConfigured: !!STRIPE_ENV,
-      stripeEnv: STRIPE_ENV || 'auto-detect',
-      webhookConfigured: !!getWebhookSecret()
+      webhookConfigured: !!getWebhookSecret(),
+      message: 'Production backend is configured for LIVE Stripe only'
     } 
   });
 });
@@ -743,7 +732,6 @@ app.post('/v1/stripe/connect/accounts', async (req, res) => {
       type: 'account_onboarding',
     });
     
-    const mode = getStripeMode();
     const accountData: ConnectAccount = {
       accountId,
       email,
@@ -772,7 +760,6 @@ app.post('/v1/stripe/connect/accounts', async (req, res) => {
 app.get('/v1/stripe/connect/accounts/:accountId', async (req, res) => {
   try {
     const { accountId } = req.params;
-    const mode = getStripeMode();
     const account = await stripe.accounts.retrieve(accountId);
     const accountData: ConnectAccount = {
       accountId: account.id,
@@ -803,7 +790,6 @@ app.post('/v1/stripe/connect/accounts/:accountId/link', async (req, res) => {
   try {
     const { accountId } = req.params;
     const { returnUrl, refreshUrl } = req.body;
-    const mode = getStripeMode();
     const accountLink = await stripe.accountLinks.create({
       account: accountId,
       refresh_url: refreshUrl || 'https://yardline.app/stripe/connect/refresh',
@@ -974,7 +960,7 @@ app.post('/v1/checkout/create-session', async (req, res) => {
         ticketSubtotalCents,
         buyerFeeTotalCents,
         totalChargeCents,
-        mode: getStripeMode(),
+        mode: 'live',
         pricingModel: 'model_a'
       }
     });
@@ -1019,7 +1005,7 @@ app.get('/v1/checkout/session/:sessionId', async (req, res) => {
         metadata: session.metadata,
         tickets: allTickets,
         ticketsCreated: allTickets.length > 0,
-        mode: getStripeMode()
+        mode: 'live'
       }
     });
   } catch (error) {
@@ -1219,7 +1205,7 @@ app.post('/v1/payments/create-intent', async (req, res) => {
         platformFeeTotalCents: buyerFeeTotalCents,
         serviceAndProcessingFeeCents: buyerFeeTotalCents,
         itemsWithFees,
-        mode: getStripeMode(),
+        mode: 'live',
         reviewMode: REVIEW_MODE,
         pricingModel: 'model_a'
       }
@@ -1624,7 +1610,7 @@ app.post('/v1/bookings', async (req, res) => {
         booking,
         paymentIntentClientSecret: confirmedPaymentIntent.client_secret,
         requiresAction: confirmedPaymentIntent.status === 'requires_action',
-        mode: getStripeMode()
+        mode: 'live'
       }
     });
   } catch (error) {
@@ -2007,5 +1993,13 @@ app.post('/v1/bookings/:id/cancel', async (req, res) => {
 // END OF OLD IN-MEMORY BOOKING ENDPOINTS
 
 app.listen(PORT, () => {
-  console.log(`YardLine API running on port ${PORT}`);
+  console.log('='.repeat(60));
+  console.log('🚀 YardLine API Server Started');
+  console.log('='.repeat(60));
+  console.log(`📍 Port: ${PORT}`);
+  console.log(`💳 Stripe Mode: LIVE ONLY (sk_live_***)`);
+  console.log(`🔒 Production Safety: Enforced`);
+  console.log(`🔔 Webhook: ${getWebhookSecret() ? 'Configured' : 'Not configured'}`);
+  console.log(`📊 Review Mode: ${REVIEW_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log('='.repeat(60));
 });

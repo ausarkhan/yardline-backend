@@ -110,8 +110,18 @@ export function createBookingV1Routes(
       // Calculate platform fee using the Safe V1 formula
       const platformFeeCents = calcPlatformFeeCents(servicePriceCents);
 
+      // Validate amount > 0 (production safety)
+      if (platformFeeCents <= 0) {
+        console.error(`❌ Invalid platform fee: ${platformFeeCents} cents for service ${service_id}`);
+        return res.status(400).json({
+          error: 'Platform fee must be greater than 0',
+          code: 'invalid_amount'
+        });
+      }
+
       // Validate minimum charge (Stripe requires at least 50 cents)
       if (platformFeeCents < 50) {
+        console.error(`❌ Platform fee below Stripe minimum: ${platformFeeCents} cents`);
         return res.status(400).json({
           error: 'Platform fee is below minimum charge',
           code: 'amount_too_small'
@@ -123,11 +133,12 @@ export function createBookingV1Routes(
 
       // Create Stripe PaymentIntent for platform fee deposit (NOT confirmed yet)
       // Client will confirm via PaymentSheet with card/Apple Pay
+      console.log(`Creating PaymentIntent for deposit: amount=${platformFeeCents} cents, service=${service_id}`);
       let paymentIntent: Stripe.PaymentIntent;
       try {
         paymentIntent = await stripe.paymentIntents.create({
           amount: platformFeeCents,
-          currency: 'usd',
+          currency: 'usd', // Enforce USD only
           automatic_payment_methods: {
             enabled: true
           },
@@ -144,8 +155,24 @@ export function createBookingV1Routes(
         }, {
           idempotencyKey
         });
+
+        // Log success (ID only, no secrets)
+        console.log(`✅ PaymentIntent created: ${paymentIntent.id}, status=${paymentIntent.status}`);
+
+        // Production safety: always return client_secret
+        if (!paymentIntent.client_secret) {
+          console.error(`❌ PaymentIntent ${paymentIntent.id} missing client_secret`);
+          throw new Error('PaymentIntent created but client_secret is missing');
+        }
       } catch (stripeError: any) {
-        console.error('Stripe PaymentIntent creation failed:', stripeError);
+        // Log and rethrow Stripe API errors
+        console.error(`❌ Stripe PaymentIntent creation failed:`, {
+          error: stripeError.message,
+          code: stripeError.code,
+          type: stripeError.type,
+          service_id,
+          amount: platformFeeCents
+        });
         return res.status(400).json({
           error: stripeError.message || 'PaymentIntent creation failed',
           code: stripeError.code || 'payment_intent_failed',
@@ -211,11 +238,17 @@ export function createBookingV1Routes(
       }
 
       // Verify PaymentIntent status with Stripe
+      console.log(`Verifying PaymentIntent: ${payment_intent_id}`);
       let paymentIntent: Stripe.PaymentIntent;
       try {
         paymentIntent = await stripe.paymentIntents.retrieve(payment_intent_id);
+        console.log(`✅ PaymentIntent retrieved: ${paymentIntent.id}, status=${paymentIntent.status}`);
       } catch (stripeError: any) {
-        console.error('Failed to retrieve PaymentIntent:', stripeError);
+        console.error(`❌ Failed to retrieve PaymentIntent ${payment_intent_id}:`, {
+          error: stripeError.message,
+          code: stripeError.code,
+          type: stripeError.type
+        });
         return res.status(400).json({
           error: 'Invalid payment_intent_id',
           code: 'invalid_payment_intent'
@@ -224,6 +257,7 @@ export function createBookingV1Routes(
 
       // Verify payment succeeded
       if (paymentIntent.status !== 'succeeded') {
+        console.error(`❌ Payment not succeeded: ${payment_intent_id}, status=${paymentIntent.status}`);
         return res.status(400).json({
           error: `Payment not succeeded. Status: ${paymentIntent.status}`,
           code: 'payment_not_succeeded',
@@ -236,11 +270,18 @@ export function createBookingV1Routes(
       if (metadata.customer_id !== customerId ||
           metadata.service_id !== service_id ||
           metadata.provider_id !== provider_id) {
+        console.error(`❌ PaymentIntent metadata mismatch:`, {
+          paymentIntent: payment_intent_id,
+          expected: { customerId, service_id, provider_id },
+          actual: metadata
+        });
         return res.status(400).json({
           error: 'PaymentIntent metadata mismatch',
           code: 'metadata_mismatch'
         });
       }
+
+      console.log(`✅ Payment verified successfully: ${payment_intent_id}`);
 
       // Check for time slot conflicts again before creating booking
       const hasConflict = await db.checkBookingConflict(
