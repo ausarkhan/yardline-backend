@@ -184,7 +184,6 @@ interface ConnectAccount {
   detailsSubmitted: boolean;
   status: 'pending' | 'restricted' | 'active';
   createdAt: string;
-  testStripeAccountId?: string;
   liveStripeAccountId?: string;
 }
 
@@ -741,17 +740,11 @@ app.post('/v1/stripe/connect/accounts', async (req, res) => {
       detailsSubmitted: false,
       status: 'pending',
       createdAt: new Date().toISOString(),
+      liveStripeAccountId: accountId
     };
     
-    // Store mode-specific account IDs
-    if (mode === 'test') {
-      accountData.testStripeAccountId = accountId;
-    } else {
-      accountData.liveStripeAccountId = accountId;
-    }
-    
     connectAccounts.set(accountId, accountData);
-    res.json({ success: true, data: { accountId, onboardingUrl: accountLink.url, mode } });
+    res.json({ success: true, data: { accountId, onboardingUrl: accountLink.url } });
   } catch (error) {
     res.status(500).json({ success: false, error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to create account' } });
   }
@@ -770,17 +763,11 @@ app.get('/v1/stripe/connect/accounts/:accountId', async (req, res) => {
       detailsSubmitted: account.details_submitted || false,
       status: account.charges_enabled && account.payouts_enabled ? 'active' : account.requirements?.disabled_reason ? 'restricted' : 'pending',
       createdAt: account.created ? new Date(account.created * 1000).toISOString() : new Date().toISOString(),
+      liveStripeAccountId: accountId
     };
     
-    // Include mode-specific account IDs
-    if (mode === 'test') {
-      accountData.testStripeAccountId = accountId;
-    } else {
-      accountData.liveStripeAccountId = accountId;
-    }
-    
     connectAccounts.set(accountId, accountData);
-    res.json({ success: true, data: accountData, mode });
+    res.json({ success: true, data: accountData });
   } catch (error) {
     res.status(500).json({ success: false, error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to get account' } });
   }
@@ -796,7 +783,7 @@ app.post('/v1/stripe/connect/accounts/:accountId/link', async (req, res) => {
       return_url: returnUrl || 'https://yardline.app/stripe/connect/return',
       type: 'account_onboarding',
     });
-    res.json({ success: true, data: { url: accountLink.url }, mode });
+    res.json({ success: true, data: { url: accountLink.url } });
   } catch (error) {
     res.status(500).json({ success: false, error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to create account link' } });
   }
