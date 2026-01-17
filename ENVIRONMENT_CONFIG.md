@@ -102,6 +102,7 @@ export REVIEW_MODE=false
 |----------|---------|-------------|
 | `STRIPE_PUBLISHABLE_KEY` | - | Publishable key returned in API responses |
 | `REVIEW_MODE` | `false` | Enable App Store review mode (limits charges to $1.00) |
+| `APP_URL_SCHEME` | `yardline` | Mobile app deep link URL scheme for checkout redirects |
 | `PORT` | `3000` | Server port |
 
 ---

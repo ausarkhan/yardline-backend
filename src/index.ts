@@ -295,19 +295,32 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
   console.log(`Processing checkout session: ${session.id}`);
   console.log(`Payment status: ${session.payment_status}`);
   
-  // CRITICAL: Only create tickets if payment is confirmed
+  // CRITICAL: Only process if payment is confirmed
   if (session.payment_status !== 'paid') {
-    console.log(`⚠️  Checkout session ${session.id} not paid yet (status: ${session.payment_status}), skipping ticket creation`);
+    console.log(`⚠️  Checkout session ${session.id} not paid yet (status: ${session.payment_status}), skipping`);
     return;
   }
 
-  // Idempotency check - prevent duplicate ticket generation
+  // Idempotency check - prevent duplicate processing
   const sessionIdempotencyKey = `checkout_${session.id}`;
   if (processedPaymentIntents.has(sessionIdempotencyKey)) {
     console.log(`Checkout session ${session.id} already processed, skipping`);
     return;
   }
 
+  // Check if this is a booking checkout session
+  const sessionMetadata = session.metadata || {};
+  if (sessionMetadata.type === 'booking') {
+    console.log(`🛒 Processing booking checkout session: ${session.id}`);
+    await handleBookingCheckoutSessionCompleted(session);
+    // Mark as processed
+    processedPaymentIntents.add(sessionIdempotencyKey);
+    return;
+  }
+
+  // Otherwise, process as ticket purchase (existing logic)
+  console.log(`🎟️  Processing ticket checkout session: ${session.id}`);
+  
   // Get the PaymentIntent to access metadata
   const paymentIntentId = session.payment_intent as string;
   if (!paymentIntentId) {
@@ -369,6 +382,69 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
     console.log(`✅ Created ${createdTickets.length} tickets for checkout session ${session.id}`);
   } catch (error) {
     console.error('Error creating tickets from checkout session:', error);
+  }
+}
+
+// Handler function for booking checkout session completed
+async function handleBookingCheckoutSessionCompleted(session: Stripe.Checkout.Session) {
+  const metadata = session.metadata || {};
+  const bookingId = metadata.bookingId;
+
+  if (!bookingId) {
+    console.error(`No bookingId in metadata for checkout session ${session.id}`);
+    return;
+  }
+
+  // Idempotency check
+  const eventKey = `booking_checkout_${session.id}`;
+  if (processedWebhookEvents.has(eventKey)) {
+    console.log(`Booking checkout session ${session.id} already processed, skipping`);
+    return;
+  }
+
+  try {
+    // Load booking
+    const booking = await db.getBooking(supabase, bookingId);
+    if (!booking) {
+      console.error(`Booking ${bookingId} not found for checkout session ${session.id}`);
+      return;
+    }
+
+    // Check if already paid
+    if (booking.stripe_checkout_session_id === session.id) {
+      console.log(`Booking ${bookingId} already marked paid with session ${session.id}`);
+      processedWebhookEvents.add(eventKey);
+      return;
+    }
+
+    // Get payment intent ID
+    const paymentIntentId = session.payment_intent as string;
+
+    // Update booking to paid status
+    const { error: updateError } = await supabase
+      .from('bookings')
+      .update({
+        status: 'confirmed',
+        payment_status: 'captured',
+        stripe_checkout_session_id: session.id,
+        payment_intent_id: paymentIntentId || booking.payment_intent_id,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', bookingId);
+
+    if (updateError) {
+      console.error(`Failed to update booking ${bookingId}:`, updateError);
+      throw updateError;
+    }
+
+    console.log(`✅ Booking ${bookingId} marked as paid via checkout session ${session.id}`);
+    console.log(`   Payment Intent: ${paymentIntentId}, Amount: $${((session.amount_total || 0) / 100).toFixed(2)}`);
+
+    // Mark as processed
+    processedWebhookEvents.add(eventKey);
+  } catch (error) {
+    console.error(`Error processing booking checkout session ${session.id}:`, error);
+    throw error; // Let webhook handler retry
   }
 }
 
@@ -649,6 +725,38 @@ app.post(
           const requiresActionPayment = event.data.object as Stripe.PaymentIntent;
           console.log(`🔐 Payment requires action: ${requiresActionPayment.id}`);
           await handleBookingPaymentEvent(requiresActionPayment);
+          break;
+
+        case 'checkout.session.async_payment_succeeded':
+          const asyncSuccessSession = event.data.object as Stripe.Checkout.Session;
+          console.log(`✅ Async payment succeeded for session: ${asyncSuccessSession.id}`);
+          // Process same as completed (payment is now confirmed)
+          if (asyncSuccessSession.metadata?.type === 'booking') {
+            await handleBookingCheckoutSessionCompleted(asyncSuccessSession);
+          } else {
+            await handleCheckoutSessionCompleted(asyncSuccessSession);
+          }
+          break;
+
+        case 'checkout.session.async_payment_failed':
+          const asyncFailedSession = event.data.object as Stripe.Checkout.Session;
+          console.log(`❌ Async payment failed for session: ${asyncFailedSession.id}`);
+          // Mark booking as payment failed if it's a booking session
+          if (asyncFailedSession.metadata?.type === 'booking' && asyncFailedSession.metadata?.bookingId) {
+            const failedBookingId = asyncFailedSession.metadata.bookingId;
+            try {
+              await supabase
+                .from('bookings')
+                .update({
+                  payment_status: 'failed',
+                  updated_at: new Date().toISOString()
+                })
+                .eq('id', failedBookingId);
+              console.log(`Marked booking ${failedBookingId} payment as failed`);
+            } catch (error) {
+              console.error(`Error marking booking ${failedBookingId} as failed:`, error);
+            }
+          }
           break;
 
         case 'account.updated':
@@ -952,12 +1060,15 @@ app.post('/v1/checkout/create-session', async (req, res) => {
       quantity: 1,
     });
 
+    // Get APP_URL_SCHEME from environment (default to 'yardline')
+    const APP_URL_SCHEME = process.env.APP_URL_SCHEME || 'yardline';
+
     // Create Checkout Session with Model A pricing structure
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       line_items: lineItems,
-      success_url: successUrl || `https://yardline.app/checkout/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: cancelUrl || 'https://yardline.app/checkout/cancel',
+      success_url: successUrl || `${APP_URL_SCHEME}://payment-success?type=ticket&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: cancelUrl || `${APP_URL_SCHEME}://payment-cancel?type=ticket&eventId=${eventId}`,
       payment_intent_data: {
         application_fee_amount: 99, // YardLine nets exactly $0.99 per ticket (in cents)
         transfer_data: {
@@ -975,6 +1086,7 @@ app.post('/v1/checkout/create-session', async (req, res) => {
         },
       },
       metadata: {
+        type: 'ticket',
         user_id: userId,
         event_id: eventId,
         pricing_model: 'model_a',
@@ -987,8 +1099,8 @@ app.post('/v1/checkout/create-session', async (req, res) => {
     res.json({ 
       success: true, 
       data: {
+        url: session.url,
         sessionId: session.id,
-        sessionUrl: session.url,
         ticketSubtotalCents,
         buyerFeeTotalCents,
         totalChargeCents,
