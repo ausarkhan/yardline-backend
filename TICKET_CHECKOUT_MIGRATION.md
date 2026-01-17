@@ -193,18 +193,22 @@ adb shell am start -a android.intent.action.VIEW \\
 
 ## 🔄 Backward Compatibility
 
-### Custom URLs Still Work
+### Breaking Change: Redirect URLs
 
-If mobile app passes custom `successUrl` and `cancelUrl`, those are used instead:
+**The backend now fully controls redirect URLs via `APP_URL_SCHEME` environment variable.**
 
-```typescript
-await fetch('/v1/checkout/create-session', {
-  body: JSON.stringify({
-    ...ticketData,
-    successUrl: 'https://custom.app/success',
-    cancelUrl: 'https://custom.app/cancel'
-  })
-});
+Clients can no longer provide custom `successUrl` and `cancelUrl` parameters. This ensures:
+- ✅ Production always uses `yardline://` scheme
+- ✅ Dev/preview environments use `vibecode://` scheme  
+- ✅ No accidental misconfiguration causing payment callbacks to fail
+
+**Environment Configuration:**
+```bash
+# Production
+export APP_URL_SCHEME=yardline
+
+# Dev/Preview
+export APP_URL_SCHEME=vibecode
 ```
 
 ### Gradual Migration Supported
@@ -212,10 +216,11 @@ await fetch('/v1/checkout/create-session', {
 Old clients using `data.sessionUrl` will break. Update to use `data.url`.
 
 **Migration Path:**
-1. Update backend (this PR)
+1. Update backend (remove custom URL support)
 2. Update mobile app to use `data.url`
-3. Add deep link handlers
-4. Deploy mobile app update
+3. Configure `APP_URL_SCHEME` in deployment environments
+4. Add deep link handlers for payment callbacks
+5. Deploy mobile app update
 
 ---
 

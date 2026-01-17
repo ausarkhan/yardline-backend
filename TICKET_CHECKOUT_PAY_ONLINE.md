@@ -24,9 +24,7 @@ Creates a Stripe Checkout Session for ticket purchases and returns the hosted pa
       "quantity": 2
     }
   ],
-  "connectedAccountId": "acct_...",
-  "successUrl": "optional-custom-url",
-  "cancelUrl": "optional-custom-url"
+  "connectedAccountId": "acct_..."
 }
 ```
 
@@ -50,17 +48,23 @@ Creates a Stripe Checkout Session for ticket purchases and returns the hosted pa
 
 ### 1. Deep Link URLs
 
-**Success URL (default if not provided):**
+**Backend-Controlled Redirect URLs:**
+
+The backend determines redirect URLs based on the `APP_URL_SCHEME` environment variable:
+- Production: `APP_URL_SCHEME=yardline` → `yardline://...`
+- Dev/Preview: `APP_URL_SCHEME=vibecode` → `vibecode://...`
+
+**Success URL:**
 ```
-yardline://payment-success?type=ticket&session_id={CHECKOUT_SESSION_ID}
+${APP_URL_SCHEME}://payment-success?type=ticket&session_id={CHECKOUT_SESSION_ID}
 ```
 
-**Cancel URL (default if not provided):**
+**Cancel URL:**
 ```
-yardline://payment-cancel?type=ticket&eventId={eventId}
+${APP_URL_SCHEME}://payment-cancel?type=ticket&eventId={eventId}
 ```
 
-The `APP_URL_SCHEME` environment variable controls the URL scheme (defaults to `yardline`).
+The URL scheme defaults to `yardline` if `APP_URL_SCHEME` is not set.
 
 ### 2. Response Format
 
@@ -85,16 +89,6 @@ Added `type: 'ticket'` to session metadata for webhook routing:
   "user_id": "uuid",
   "event_id": "uuid",
   "pricing_model": "model_a"
-}
-```
-
-### 4. Custom URLs Still Supported
-
-Clients can override default deep links by providing:
-```json
-{
-  "successUrl": "custom://success?param=value",
-  "cancelUrl": "custom://cancel"
 }
 ```
 
@@ -294,6 +288,7 @@ adb shell am start -a android.intent.action.VIEW -d "yardline://payment-success?
 ✅ **Webhook verification** - Signature validation required  
 ✅ **Idempotent processing** - Duplicate webhooks handled safely  
 ✅ **Connect transfers** - Host receives full ticket price  
+✅ **Backend-controlled redirects** - URLs determined by APP_URL_SCHEME
 
 ## Migration Notes
 
@@ -303,12 +298,15 @@ adb shell am start -a android.intent.action.VIEW -d "yardline://payment-success?
 - Old: `data.sessionUrl`
 - New: `data.url`
 
+**Redirect URLs Now Backend-Controlled:**
+- Client can no longer provide `successUrl`/`cancelUrl`
+- Backend uses `APP_URL_SCHEME` environment variable
+- Production: `yardline://`, Dev/Preview: `vibecode://`
+
 **Update mobile app to use `data.url` instead of `data.sessionUrl`**
 
 ### Non-Breaking Changes
 
-- Default success/cancel URLs now use deep links
-- Custom URLs still work via `successUrl`/`cancelUrl` parameters
 - Session metadata includes `type: 'ticket'` (backward compatible)
 
 ### Frontend Migration

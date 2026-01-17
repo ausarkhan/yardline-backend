@@ -951,9 +951,7 @@ app.post('/v1/checkout/create-session', async (req, res) => {
       eventId, 
       eventName,
       items, // Array of { ticketTypeId, ticketTypeName, priceCents, quantity }
-      connectedAccountId,
-      successUrl,
-      cancelUrl
+      connectedAccountId
     } = req.body;
 
     // Validate required fields
@@ -1061,14 +1059,15 @@ app.post('/v1/checkout/create-session', async (req, res) => {
     });
 
     // Get APP_URL_SCHEME from environment (default to 'yardline')
+    // Production uses 'yardline://', dev/preview uses 'vibecode://'
     const APP_URL_SCHEME = process.env.APP_URL_SCHEME || 'yardline';
 
     // Create Checkout Session with Model A pricing structure
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       line_items: lineItems,
-      success_url: successUrl || `${APP_URL_SCHEME}://payment-success?type=ticket&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: cancelUrl || `${APP_URL_SCHEME}://payment-cancel?type=ticket&eventId=${eventId}`,
+      success_url: `${APP_URL_SCHEME}://payment-success?type=ticket&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${APP_URL_SCHEME}://payment-cancel?type=ticket&eventId=${eventId}`,
       payment_intent_data: {
         application_fee_amount: 99, // YardLine nets exactly $0.99 per ticket (in cents)
         transfer_data: {

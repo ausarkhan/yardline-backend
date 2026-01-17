@@ -784,6 +784,7 @@ export function createBookingRoutes(
       }
 
       // Get APP_URL_SCHEME from environment (default to 'yardline')
+      // Production uses 'yardline://', dev/preview uses 'vibecode://'
       const APP_URL_SCHEME = process.env.APP_URL_SCHEME || 'yardline';
 
       // Create Stripe Checkout Session
