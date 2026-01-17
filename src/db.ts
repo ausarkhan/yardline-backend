@@ -27,6 +27,7 @@ export interface DBBooking {
   status: 'pending' | 'accepted' | 'confirmed' | 'declined' | 'cancelled' | 'expired';
   payment_status: 'none' | 'authorized' | 'captured' | 'canceled' | 'failed' | 'expired';
   payment_intent_id: string | null;
+  stripe_checkout_session_id: string | null;
   amount_total: number | null;
   service_price_cents: number | null;
   platform_fee_cents: number | null;
