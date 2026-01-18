@@ -1163,6 +1163,183 @@ app.get('/v1/checkout/session/:sessionId', async (req, res) => {
   }
 });
 
+// POST /v1/checkout/session - Alias for create-session endpoint
+// Frontend calls this instead of /v1/checkout/create-session
+app.post('/v1/checkout/session', async (req, res) => {
+  try {
+    const { 
+      userId, 
+      eventId, 
+      eventName,
+      items, // Array of { ticketTypeId, ticketTypeName, priceCents, quantity }
+      connectedAccountId
+    } = req.body;
+
+    // Validate required fields
+    if (!userId || !eventId || !items || !Array.isArray(items) || items.length === 0 || !connectedAccountId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: { 
+          type: 'invalid_request_error', 
+          message: 'Missing required fields: userId, eventId, items, and connectedAccountId are required' 
+        } 
+      });
+    }
+
+    // Calculate totals server-side using Model A pricing
+    let ticketSubtotalCents = 0;
+    let buyerFeeTotalCents = 0;
+
+    const itemsWithFees = items.map((item: any) => {
+      const { ticketTypeId, ticketTypeName, priceCents, quantity } = item;
+      
+      if (!ticketTypeId || !ticketTypeName || typeof priceCents !== 'number' || typeof quantity !== 'number') {
+        throw new Error('Invalid item format');
+      }
+
+      // Calculate buyer fee per ticket (covers YardLine $0.99 + Stripe fees)
+      const buyerFeePerTicket = calculateBuyerFeePerTicket(priceCents);
+      const buyerFeeCents = buyerFeePerTicket * quantity;
+
+      // Validate the pricing model for each ticket
+      const validation = validateModelAPricing(priceCents, buyerFeePerTicket);
+      if (!validation.isValid) {
+        console.warn(`⚠️  Model A validation warning: ${validation.details}`);
+      } else {
+        console.log(`✅ Model A validated: ${validation.details}`);
+      }
+
+      ticketSubtotalCents += priceCents * quantity;
+      buyerFeeTotalCents += buyerFeeCents;
+
+      return {
+        ticketTypeId,
+        ticketTypeName,
+        priceCents,
+        quantity,
+        buyerFeeCents,
+        buyerFeePerTicket
+      };
+    });
+
+    const totalChargeCents = ticketSubtotalCents + buyerFeeTotalCents;
+
+    // Review mode guardrail
+    if (REVIEW_MODE && totalChargeCents > REVIEW_MODE_MAX_CHARGE_CENTS) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: 'review_mode_error',
+          message: `Review mode is enabled. Maximum charge is $${REVIEW_MODE_MAX_CHARGE_CENTS / 100}`,
+          code: 'review_mode_limit_exceeded'
+        }
+      });
+    }
+
+    // Minimum charge validation
+    if (totalChargeCents < 50) {
+      return res.status(400).json({ 
+        success: false, 
+        error: { 
+          type: 'invalid_request_error', 
+          message: 'Amount must be at least $0.50 USD', 
+          code: 'amount_too_small' 
+        } 
+      });
+    }
+
+    // Create line items for Checkout
+    const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = [];
+    
+    // Add ticket line items
+    for (const item of itemsWithFees) {
+      lineItems.push({
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: item.ticketTypeName,
+            description: `${eventName || 'Event'} - ${item.ticketTypeName}`,
+          },
+          unit_amount: item.priceCents,
+        },
+        quantity: item.quantity,
+      });
+    }
+
+    // Add service & processing fee as a single line item
+    lineItems.push({
+      price_data: {
+        currency: 'usd',
+        product_data: {
+          name: 'Service & processing fee',
+          description: 'Covers platform services and payment processing',
+        },
+        unit_amount: buyerFeeTotalCents,
+      },
+      quantity: 1,
+    });
+
+    // Get APP_URL_SCHEME from environment (default to 'yardline')
+    // Production uses 'yardline://', dev/preview uses 'vibecode://'
+    const APP_URL_SCHEME = process.env.APP_URL_SCHEME || 'yardline';
+
+    // Create Checkout Session with Model A pricing structure
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: lineItems,
+      success_url: `${APP_URL_SCHEME}://payment-success?type=ticket&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${APP_URL_SCHEME}://payment-cancel?type=ticket&eventId=${eventId}`,
+      payment_intent_data: {
+        application_fee_amount: 99, // YardLine nets exactly $0.99 per ticket (in cents)
+        transfer_data: {
+          destination: connectedAccountId, // Host receives ticket price
+        },
+        metadata: {
+          user_id: userId,
+          event_id: eventId,
+          pricing_model: 'model_a',
+          ticket_subtotal_cents: String(ticketSubtotalCents),
+          buyer_fee_total_cents: String(buyerFeeTotalCents),
+          total_charge_cents: String(totalChargeCents),
+          items_json: JSON.stringify(itemsWithFees),
+          review_mode: String(REVIEW_MODE)
+        },
+      },
+      metadata: {
+        type: 'ticket',
+        user_id: userId,
+        event_id: eventId,
+        pricing_model: 'model_a',
+      },
+    });
+
+    console.log(`✅ Created Checkout Session ${session.id} for event ${eventId} (via /v1/checkout/session)`);
+    console.log(`   Total: $${(totalChargeCents / 100).toFixed(2)}, Ticket: $${(ticketSubtotalCents / 100).toFixed(2)}, Fee: $${(buyerFeeTotalCents / 100).toFixed(2)}`);
+
+    res.json({ 
+      success: true, 
+      data: {
+        url: session.url,
+        sessionId: session.id,
+        ticketSubtotalCents,
+        buyerFeeTotalCents,
+        totalChargeCents,
+        mode: 'live',
+        pricingModel: 'model_a'
+      }
+    });
+  } catch (error) {
+    console.error('Error creating checkout session:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: { 
+        type: 'api_error', 
+        message: error instanceof Error ? error.message : 'Failed to create checkout session' 
+      } 
+    });
+  }
+});
+
 // POST /v1/payments/create-intent - PaymentSheet-compatible endpoint
 // This endpoint calculates all amounts server-side and supports saved payment methods
 app.post('/v1/payments/create-intent', async (req, res) => {
