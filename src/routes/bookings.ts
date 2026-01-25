@@ -568,8 +568,33 @@ export function createBookingRoutes(
         });
       }
 
-      if (booking.payment_status === 'captured' || booking.stripe_checkout_session_id) {
-        return res.status(400).json({ error: 'Booking payment already completed' });
+      if (booking.payment_status === 'captured') {
+        return res.status(409).json({
+          error: 'Booking payment already completed',
+          code: 'already_paid'
+        });
+      }
+
+      if (booking.stripe_checkout_session_id) {
+        const existingSession = await stripe.checkout.sessions.retrieve(
+          booking.stripe_checkout_session_id
+        );
+
+        if (!existingSession.url || !existingSession.id) {
+          console.error('Existing checkout session missing url or id', {
+            sessionId: existingSession.id,
+            url: existingSession.url
+          });
+          return res.status(500).json({ error: 'Stripe checkout session missing url or id' });
+        }
+
+        return res.json({
+          success: true,
+          data: {
+            url: existingSession.url,
+            sessionId: existingSession.id
+          }
+        });
       }
 
       const totalFromComponents =
@@ -685,6 +710,19 @@ export function createBookingRoutes(
         return res.status(500).json({ error: 'Stripe checkout session missing url or id' });
       }
 
+      const { error: updateError } = await supabase
+        .from('bookings')
+        .update({
+          stripe_checkout_session_id: session.id,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', bookingId);
+
+      if (updateError) {
+        console.error('Failed to store checkout session ID on booking:', updateError);
+        return res.status(500).json({ error: 'Failed to persist checkout session' });
+      }
+
       console.log(
         JSON.stringify({
           event: 'booking.checkout_session.created',
@@ -695,7 +733,13 @@ export function createBookingRoutes(
         })
       );
 
-      res.json({ url: session.url, sessionId: session.id });
+      res.json({
+        success: true,
+        data: {
+          url: session.url,
+          sessionId: session.id
+        }
+      });
     } catch (error) {
       const stripeError = error as any;
       console.error('Error creating checkout session for booking:', {

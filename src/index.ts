@@ -416,8 +416,10 @@ async function handleBookingCheckoutSessionCompleted(session: Stripe.Checkout.Se
     }
 
     // Check if already paid
-    if (booking.payment_status === 'captured' && booking.stripe_checkout_session_id === session.id) {
-      console.log(`Booking ${bookingId} already marked paid with session ${session.id}`);
+    if (booking.payment_status === 'captured') {
+      console.log(
+        `Booking ${bookingId} already marked paid with session ${booking.stripe_checkout_session_id || 'unknown'}`
+      );
       processedWebhookEvents.add(eventKey);
       return;
     }
