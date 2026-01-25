@@ -702,8 +702,8 @@ export function createBookingRoutes(
       const { bookingId } = req.body;
       const userId = req.user!.id;
 
-      if (!bookingId) {
-        return res.status(400).json({ error: 'Missing required field: bookingId' });
+      if (!bookingId || typeof bookingId !== 'string') {
+        return res.status(400).json({ error: 'Missing or invalid required field: bookingId' });
       }
 
       const booking = await db.getBooking(supabase, bookingId);
@@ -715,14 +715,20 @@ export function createBookingRoutes(
         return res.status(403).json({ error: 'You do not have permission to pay for this booking' });
       }
 
-      const totalCents =
+      const totalCentsRaw =
         booking.amount_total ??
         (booking as any).total_cents ??
         (booking as any).totalCents ??
         booking.service_price_cents ??
         null;
 
-      if (!totalCents || totalCents < 50) {
+      const totalCents = typeof totalCentsRaw === 'number' ? totalCentsRaw : Number(totalCentsRaw);
+
+      if (!Number.isInteger(totalCents)) {
+        return res.status(400).json({ error: 'Booking totalCents must be an integer' });
+      }
+
+      if (totalCents < 50) {
         return res.status(400).json({ error: 'Booking totalCents must be at least 50' });
       }
 
@@ -733,8 +739,8 @@ export function createBookingRoutes(
           serviceName = service.name;
         }
       }
-      if (!serviceName) {
-        serviceName = 'Service';
+      if (!serviceName || typeof serviceName !== 'string') {
+        return res.status(400).json({ error: 'Booking serviceName is missing or invalid' });
       }
 
       const sessionParams: Stripe.Checkout.SessionCreateParams = {
@@ -755,22 +761,58 @@ export function createBookingRoutes(
         success_url: `vibecode://payment-success?type=booking&session_id={CHECKOUT_SESSION_ID}&booking_id=${bookingId}`,
         cancel_url: `vibecode://payment-cancel?type=booking&booking_id=${bookingId}`,
         metadata: {
-          bookingId
+          bookingId,
+          type: 'booking'
         }
       };
 
-      const providerStripeAccountId =
+      // Use the same Stripe Connect pattern as ticket checkout (destination charges)
+      let providerStripeAccountId: string | null =
         (booking as any).provider_stripe_account_id ||
         (booking as any).providerStripeAccountId ||
         null;
 
-      const session = providerStripeAccountId
-        ? await stripe.checkout.sessions.create(sessionParams, { stripeAccount: providerStripeAccountId })
-        : await stripe.checkout.sessions.create(sessionParams);
+      if (!providerStripeAccountId && booking.provider_id) {
+        providerStripeAccountId = await getOrCreateStripeAccountId(
+          booking.provider_id,
+          `provider-${booking.provider_id}@yardline.app`,
+          `Provider ${booking.provider_id}`
+        );
+      }
+
+      if (providerStripeAccountId) {
+        const platformFeeCents =
+          booking.platform_fee_cents ??
+          (booking as any).platformFeeCents ??
+          null;
+        const applicationFee = typeof platformFeeCents === 'number' ? platformFeeCents : Number(platformFeeCents);
+
+        sessionParams.payment_intent_data = {
+          transfer_data: {
+            destination: providerStripeAccountId
+          },
+          ...(Number.isInteger(applicationFee) && applicationFee > 0
+            ? { application_fee_amount: applicationFee }
+            : {})
+        };
+      }
+
+      const session = await stripe.checkout.sessions.create(sessionParams);
+
+      if (!session.url || !session.id) {
+        console.error('Checkout session missing url or id', { sessionId: session.id, url: session.url });
+        return res.status(500).json({ error: 'Stripe checkout session missing url or id' });
+      }
 
       res.json({ url: session.url, sessionId: session.id });
     } catch (error) {
-      console.error('Error creating checkout session for booking:', error);
+      const stripeError = error as any;
+      console.error('Error creating checkout session for booking:', {
+        message: stripeError?.message,
+        type: stripeError?.type,
+        code: stripeError?.code,
+        raw: stripeError?.raw
+      });
       res.status(500).json({ error: 'Failed to create checkout session' });
     }
   });
