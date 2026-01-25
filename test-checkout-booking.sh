@@ -95,7 +95,46 @@ echo "   Status: $BOOKING_STATUS, Payment: $PAYMENT_STATUS"
 echo ""
 
 echo "=================================================="
-echo "Step 3: Create Checkout Session"
+echo "Step 3: Verify payment blocked before acceptance"
+echo "=================================================="
+
+PRECHECK_RESPONSE=$(curl -s -X POST "$API_URL/v1/bookings/checkout-session" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $AUTH_TOKEN" \
+  -d "{
+    \"bookingId\": \"$BOOKING_ID\"
+  }")
+
+PRECHECK_MESSAGE=$(echo "$PRECHECK_RESPONSE" | jq -r '.error // empty')
+if [ "$PRECHECK_MESSAGE" = "Payment available only after provider accepts the appointment." ]; then
+  echo -e "${GREEN}✅ Correctly blocked payment before acceptance${NC}"
+else
+  echo -e "${RED}❌ Expected acceptance gate message${NC}"
+  echo "Response: $PRECHECK_RESPONSE"
+  exit 1
+fi
+
+echo ""
+echo "=================================================="
+echo "Step 4: Provider accepts booking"
+echo "=================================================="
+
+ACCEPT_RESPONSE=$(curl -s -X POST "$API_URL/v1/bookings/$BOOKING_ID/accept" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $AUTH_TOKEN")
+
+ACCEPT_STATUS=$(echo "$ACCEPT_RESPONSE" | jq -r '.data.booking.status // empty')
+if [ "$ACCEPT_STATUS" = "accepted" ]; then
+  echo -e "${GREEN}✅ Booking accepted${NC}"
+else
+  echo -e "${RED}❌ Failed to accept booking${NC}"
+  echo "Response: $ACCEPT_RESPONSE"
+  exit 1
+fi
+
+echo ""
+echo "=================================================="
+echo "Step 5: Create Checkout Session"
 echo "=================================================="
 
 CHECKOUT_RESPONSE=$(curl -s -X POST "$API_URL/v1/bookings/checkout-session" \
@@ -105,8 +144,8 @@ CHECKOUT_RESPONSE=$(curl -s -X POST "$API_URL/v1/bookings/checkout-session" \
     \"bookingId\": \"$BOOKING_ID\"
   }")
 
-CHECKOUT_URL=$(echo "$CHECKOUT_RESPONSE" | jq -r '.data.url // empty')
-SESSION_ID=$(echo "$CHECKOUT_RESPONSE" | jq -r '.data.sessionId // empty')
+CHECKOUT_URL=$(echo "$CHECKOUT_RESPONSE" | jq -r '.url // .data.url // empty')
+SESSION_ID=$(echo "$CHECKOUT_RESPONSE" | jq -r '.sessionId // .data.sessionId // empty')
 
 if [ -z "$CHECKOUT_URL" ] || [ -z "$SESSION_ID" ]; then
   echo -e "${RED}❌ Failed to create checkout session${NC}"
@@ -120,7 +159,7 @@ echo "   URL: $CHECKOUT_URL"
 echo ""
 
 echo "=================================================="
-echo "Step 4: Manual Payment (Open URL in browser)"
+echo "Step 6: Manual Payment (Open URL in browser)"
 echo "=================================================="
 
 echo -e "${YELLOW}⚠️  ACTION REQUIRED:${NC}"
@@ -137,7 +176,7 @@ read -p "Press ENTER after completing the payment..."
 
 echo ""
 echo "=================================================="
-echo "Step 5: Verify booking was updated by webhook"
+echo "Step 7: Verify booking was updated by webhook"
 echo "=================================================="
 
 sleep 3  # Give webhook time to process
@@ -168,7 +207,7 @@ fi
 
 echo ""
 echo "=================================================="
-echo "Step 6: Test error cases"
+echo "Step 8: Test error cases"
 echo "=================================================="
 
 # Test 6a: Try to create another checkout session for same booking

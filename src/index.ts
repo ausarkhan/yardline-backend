@@ -203,7 +203,7 @@ interface Ticket {
 }
 
 // Booking system types for service requests
-type BookingStatus = 'pending' | 'confirmed' | 'declined' | 'cancelled' | 'expired';
+type BookingStatus = 'checkout_created' | 'pending' | 'accepted' | 'confirmed' | 'declined' | 'cancelled' | 'expired';
 type PaymentStatus = 'none' | 'authorized' | 'captured' | 'canceled' | 'failed';
 
 interface Booking {
@@ -390,6 +390,11 @@ async function handleBookingCheckoutSessionCompleted(session: Stripe.Checkout.Se
   const metadata = session.metadata || {};
   const bookingId = metadata.bookingId;
 
+  if (metadata.type !== 'booking') {
+    console.log(`Skipping non-booking checkout session ${session.id}`);
+    return;
+  }
+
   if (!bookingId) {
     console.error(`No bookingId in metadata for checkout session ${session.id}`);
     return;
@@ -411,7 +416,7 @@ async function handleBookingCheckoutSessionCompleted(session: Stripe.Checkout.Se
     }
 
     // Check if already paid
-    if (booking.stripe_checkout_session_id === session.id) {
+    if (booking.payment_status === 'captured' && booking.stripe_checkout_session_id === session.id) {
       console.log(`Booking ${bookingId} already marked paid with session ${session.id}`);
       processedWebhookEvents.add(eventKey);
       return;
@@ -424,7 +429,7 @@ async function handleBookingCheckoutSessionCompleted(session: Stripe.Checkout.Se
     const { error: updateError } = await supabase
       .from('bookings')
       .update({
-        status: 'confirmed',
+        status: booking.status === 'checkout_created' ? 'pending' : booking.status,
         payment_status: 'captured',
         stripe_checkout_session_id: session.id,
         payment_intent_id: paymentIntentId || booking.payment_intent_id,
@@ -437,8 +442,15 @@ async function handleBookingCheckoutSessionCompleted(session: Stripe.Checkout.Se
       throw updateError;
     }
 
-    console.log(`✅ Booking ${bookingId} marked as paid via checkout session ${session.id}`);
-    console.log(`   Payment Intent: ${paymentIntentId}, Amount: $${((session.amount_total || 0) / 100).toFixed(2)}`);
+    console.log(
+      JSON.stringify({
+        event: 'booking.payment.succeeded',
+        bookingId,
+        sessionId: session.id,
+        paymentStatus: session.payment_status,
+        updatedStatus: booking.status === 'checkout_created' ? 'pending' : booking.status
+      })
+    );
 
     // Mark as processed
     processedWebhookEvents.add(eventKey);
@@ -546,8 +558,8 @@ async function handleBookingPaymentEvent(paymentIntent: Stripe.PaymentIntent) {
         // Payment captured successfully
         if (booking.payment_status !== 'captured') {
           newPaymentStatus = 'captured';
-          if (booking.status === 'pending') {
-            newStatus = 'confirmed';
+          if (booking.status === 'checkout_created') {
+            newStatus = 'pending';
           }
           console.log(`✅ Booking ${bookingId} payment captured (webhook)`);
         }
@@ -557,9 +569,6 @@ async function handleBookingPaymentEvent(paymentIntent: Stripe.PaymentIntent) {
         // Payment canceled
         if (booking.payment_status !== 'canceled') {
           newPaymentStatus = 'canceled';
-          if (booking.status === 'pending') {
-            newStatus = 'cancelled';
-          }
           console.log(`✅ Booking ${bookingId} payment canceled (webhook)`);
         }
         break;
@@ -614,9 +623,8 @@ async function handleBookingPaymentFailed(paymentIntent: Stripe.PaymentIntent) {
       return;
     }
 
-    // Update booking to reflect payment failure
-    const newStatus = booking.status === 'pending' ? 'cancelled' : booking.status;
-    await db.updateBookingStatus(supabase, bookingId, newStatus, 'failed');
+    // Update booking to reflect payment failure (do not request/accept automatically)
+    await db.updateBookingStatus(supabase, bookingId, booking.status, 'failed');
 
     console.log(`❌ Booking ${bookingId} payment failed (webhook)`);
 

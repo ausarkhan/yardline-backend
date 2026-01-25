@@ -86,7 +86,7 @@ export function createBookingRoutes(
     }
   });
 
-  // POST /v1/bookings - Create booking request with payment authorization (customer)
+  // POST /v1/bookings - Create booking request (no charge until accepted)
   router.post('/bookings', authenticateUser(supabase), async (req, res) => {
     try {
       const {
@@ -228,109 +228,7 @@ export function createBookingRoutes(
         });
       }
 
-      // Create or retrieve Stripe Customer
-      console.log(`Looking up or creating Stripe customer for email: ${customerEmail}`);
-      let stripeCustomerId: string | undefined;
-      if (customerEmail) {
-        try {
-          const customers = await stripe.customers.list({
-            email: customerEmail,
-            limit: 1
-          });
-
-          if (customers.data.length > 0) {
-            stripeCustomerId = customers.data[0].id;
-            console.log(`✅ Found existing Stripe customer: ${stripeCustomerId}`);
-          } else {
-            const customer = await stripe.customers.create({
-              email: customerEmail,
-              name: customerName,
-              metadata: { customerId }
-            });
-            stripeCustomerId = customer.id;
-            console.log(`✅ Created new Stripe customer: ${stripeCustomerId}`);
-          }
-        } catch (stripeError: any) {
-          console.error(`❌ Failed to create/retrieve Stripe customer:`, {
-            error: stripeError.message,
-            code: stripeError.code
-          });
-          throw stripeError;
-        }
-      }
-
-      // Get provider's connected account ID
-      const providerAccountId = await getOrCreateStripeAccountId(
-        providerId,
-        `provider-${providerId}@yardline.app`,
-        `Provider ${providerId}`
-      );
-
-      // Create PaymentIntent with capture_method="manual"
-      console.log(`Creating PaymentIntent: amount=${totalChargeCents} cents, provider=${providerAccountId}`);
-      const paymentIntentParams: Stripe.PaymentIntentCreateParams = {
-        amount: totalChargeCents,
-        currency: 'usd', // Enforce USD only
-        capture_method: 'manual',
-        description: `YardLine Booking - ${date} ${timeStart}`,
-        metadata: {
-          customer_id: customerId,
-          provider_id: providerId,
-          service_id: serviceId || 'custom',
-          service_price_cents: String(servicePriceCents),
-          platform_fee_cents: String(platformFeeCents),
-          total_charge_cents: String(totalChargeCents),
-          date: date,
-          time_start: timeStart,
-          time_end: calculatedTimeEnd,
-          pricing_model: 'model_a',
-          review_mode: String(REVIEW_MODE)
-        },
-        automatic_payment_methods: {
-          enabled: true,
-          allow_redirects: 'never'
-        },
-        transfer_data: {
-          destination: providerAccountId
-        },
-        application_fee_amount: platformFeeCents
-      };
-
-      if (stripeCustomerId) {
-        paymentIntentParams.customer = stripeCustomerId;
-      }
-
-      // Create and confirm payment intent
-      const idempotencyKey = `booking_${customerId}_${date}_${timeStart}_${Date.now()}`;
-      let paymentIntent: Stripe.PaymentIntent;
-      let confirmedPaymentIntent: Stripe.PaymentIntent;
-      
-      try {
-        paymentIntent = await stripe.paymentIntents.create(paymentIntentParams, { idempotencyKey });
-        console.log(`✅ PaymentIntent created: ${paymentIntent.id}, status=${paymentIntent.status}`);
-
-        // Production safety: always return client_secret
-        if (!paymentIntent.client_secret) {
-          console.error(`❌ PaymentIntent ${paymentIntent.id} missing client_secret`);
-          throw new Error('PaymentIntent created but client_secret is missing');
-        }
-
-        confirmedPaymentIntent = await stripe.paymentIntents.confirm(paymentIntent.id, {
-          return_url: 'https://yardline.app/bookings/return'
-        });
-        console.log(`✅ PaymentIntent confirmed: ${confirmedPaymentIntent.id}, status=${confirmedPaymentIntent.status}`);
-      } catch (stripeError: any) {
-        // Log and rethrow Stripe API errors
-        console.error(`❌ Stripe PaymentIntent creation/confirmation failed:`, {
-          error: stripeError.message,
-          code: stripeError.code,
-          type: stripeError.type,
-          amount: totalChargeCents
-        });
-        throw stripeError;
-      }
-
-      // Create booking in database
+      // Create booking in database (no charge at request time)
       try {
         const booking = await db.createBooking(supabase, {
           customerId,
@@ -339,37 +237,21 @@ export function createBookingRoutes(
           date,
           timeStart,
           timeEnd: calculatedTimeEnd,
-          paymentIntentId: paymentIntent.id,
+          paymentIntentId: null,
           amountTotal: totalChargeCents,
           servicePriceCents,
           platformFeeCents
         });
 
-        console.log(`✅ Created booking ${booking.id} with payment authorization (PaymentIntent: ${paymentIntent.id})`);
+        console.log(`✅ Created booking ${booking.id} (awaiting customer payment)`);
 
         res.json({
           success: true,
-          data: {
-            booking,
-            paymentIntentClientSecret: confirmedPaymentIntent.client_secret,
-            requiresAction: confirmedPaymentIntent.status === 'requires_action'
-          }
+          data: { booking }
         });
       } catch (dbError: any) {
         // Handle conflict from database constraint
         if (dbError.code === 'BOOKING_CONFLICT' || dbError.statusCode === 409) {
-          // Cancel the payment intent since we can't create the booking
-          console.log(`Canceling PaymentIntent ${paymentIntent.id} due to booking conflict`);
-          try {
-            await stripe.paymentIntents.cancel(paymentIntent.id);
-            console.log(`✅ PaymentIntent ${paymentIntent.id} canceled successfully`);
-          } catch (stripeError: any) {
-            console.error(`❌ Error canceling PaymentIntent ${paymentIntent.id}:`, {
-              error: stripeError.message,
-              code: stripeError.code
-            });
-          }
-          
           return res.status(409).json({
             success: false,
             error: {
@@ -479,6 +361,17 @@ export function createBookingRoutes(
         });
       }
 
+      // Require payment before provider acceptance
+      if (booking.payment_status !== 'captured') {
+        return res.status(409).json({
+          success: false,
+          error: {
+            type: 'invalid_state',
+            message: 'Booking payment must be completed before acceptance'
+          }
+        });
+      }
+
       // Use transaction-based accept with conflict check
       const result = await db.acceptBookingTransaction(supabase, id);
 
@@ -501,59 +394,12 @@ export function createBookingRoutes(
         });
       }
 
-      // Capture the PaymentIntent
-      console.log(`Capturing payment for booking ${id}, PaymentIntent: ${booking.payment_intent_id}`);
-      try {
-        const captureIdempotencyKey = `capture_${id}`;
-        const capturedPaymentIntent = await stripe.paymentIntents.capture(
-          booking.payment_intent_id!,
-          {},
-          { idempotencyKey: captureIdempotencyKey }
-        );
-
-        console.log(`✅ Booking ${id} accepted and payment captured: ${capturedPaymentIntent.id}, status=${capturedPaymentIntent.status}`);
-
-        res.json({
-          success: true,
-          data: {
-            booking: result.booking,
-            paymentIntentStatus: capturedPaymentIntent.status
-          }
-        });
-      } catch (stripeError: any) {
-        console.error(`❌ Error capturing payment for booking ${id}:`, {
-          error: stripeError.message,
-          code: stripeError.code,
-          type: stripeError.type,
-          paymentIntent: booking.payment_intent_id
-        });
-
-        // Handle authorization expiry
-        if (stripeError.code === 'charge_expired_for_capture') {
-          await db.updateBookingStatus(supabase, id, 'expired', 'failed');
-
-          return res.status(400).json({
-            success: false,
-            error: {
-              type: 'payment_expired',
-              message: 'Payment authorization has expired. Customer must re-confirm payment.',
-              code: 'charge_expired_for_capture'
-            }
-          });
+      res.json({
+        success: true,
+        data: {
+          booking: result.booking
         }
-
-        // Other payment errors
-        await db.updateBookingPaymentStatus(supabase, id, 'failed');
-
-        return res.status(400).json({
-          success: false,
-          error: {
-            type: 'payment_error',
-            message: stripeError.message || 'Failed to capture payment',
-            code: stripeError.code
-          }
-        });
-      }
+      });
     } catch (error: any) {
       console.error('Error accepting booking:', error);
       res.status(500).json({
@@ -598,19 +444,14 @@ export function createBookingRoutes(
         });
       }
 
-      // Cancel the PaymentIntent
-      if (booking.payment_intent_id) {
-        console.log(`Canceling PaymentIntent ${booking.payment_intent_id} for declined booking ${id}`);
-        try {
-          await stripe.paymentIntents.cancel(booking.payment_intent_id);
-          console.log(`✅ PaymentIntent ${booking.payment_intent_id} canceled successfully`);
-        } catch (stripeError: any) {
-          console.error(`❌ Error canceling PaymentIntent ${booking.payment_intent_id}:`, {
-            error: stripeError.message,
-            code: stripeError.code
-          });
-          console.error('Error canceling payment intent:', stripeError);
-        }
+      if (booking.payment_status !== 'captured') {
+        return res.status(409).json({
+          success: false,
+          error: {
+            type: 'invalid_state',
+            message: 'Booking payment must be completed before decline'
+          }
+        });
       }
 
       // Update booking status
@@ -652,7 +493,7 @@ export function createBookingRoutes(
       }
 
       // Handle cancellation based on current status
-      if (booking.status === 'pending') {
+      if (booking.status === 'pending' || booking.status === 'checkout_created') {
         // Cancel authorization
         if (booking.payment_intent_id) {
           try {
@@ -662,7 +503,13 @@ export function createBookingRoutes(
           }
         }
 
-        const updatedBooking = await db.updateBookingStatus(supabase, id, 'cancelled', 'canceled', reason);
+        const updatedBooking = await db.updateBookingStatus(
+          supabase,
+          id,
+          'cancelled',
+          booking.payment_status === 'none' ? 'none' : 'canceled',
+          reason
+        );
 
         console.log(`✅ Booking ${id} cancelled by customer`);
 
@@ -715,12 +562,23 @@ export function createBookingRoutes(
         return res.status(403).json({ error: 'You do not have permission to pay for this booking' });
       }
 
+      if (booking.status !== 'checkout_created') {
+        return res.status(409).json({
+          error: 'Payment is only available for unpaid bookings.'
+        });
+      }
+
+      if (booking.payment_status === 'captured' || booking.stripe_checkout_session_id) {
+        return res.status(400).json({ error: 'Booking payment already completed' });
+      }
+
+      const totalFromComponents =
+        (booking.service_price_cents ?? 0) + (booking.platform_fee_cents ?? 0);
       const totalCentsRaw =
         booking.amount_total ??
         (booking as any).total_cents ??
         (booking as any).totalCents ??
-        booking.service_price_cents ??
-        null;
+        totalFromComponents;
 
       const totalCents = typeof totalCentsRaw === 'number' ? totalCentsRaw : Number(totalCentsRaw);
 
@@ -743,6 +601,7 @@ export function createBookingRoutes(
         return res.status(400).json({ error: 'Booking serviceName is missing or invalid' });
       }
 
+      const appUrlScheme = process.env.APP_URL_SCHEME || 'yardline';
       const sessionParams: Stripe.Checkout.SessionCreateParams = {
         mode: 'payment',
         payment_method_types: ['card'],
@@ -758,11 +617,14 @@ export function createBookingRoutes(
             quantity: 1
           }
         ],
-        success_url: `vibecode://payment-success?type=booking&session_id={CHECKOUT_SESSION_ID}&booking_id=${bookingId}`,
-        cancel_url: `vibecode://payment-cancel?type=booking&booking_id=${bookingId}`,
+        success_url: `${appUrlScheme}://payment-success?type=booking&session_id={CHECKOUT_SESSION_ID}&booking_id=${bookingId}`,
+        cancel_url: `${appUrlScheme}://payment-cancel?type=booking&booking_id=${bookingId}`,
         metadata: {
+          type: 'booking',
           bookingId,
-          type: 'booking'
+          userId: booking.customer_id,
+          providerId: booking.provider_id,
+          serviceName
         }
       };
 
@@ -791,9 +653,28 @@ export function createBookingRoutes(
           transfer_data: {
             destination: providerStripeAccountId
           },
+          metadata: {
+            booking_id: bookingId,
+            bookingId,
+            type: 'booking',
+            customer_id: booking.customer_id,
+            provider_id: booking.provider_id,
+            service_name: serviceName
+          },
           ...(Number.isInteger(applicationFee) && applicationFee > 0
             ? { application_fee_amount: applicationFee }
             : {})
+        };
+      } else {
+        sessionParams.payment_intent_data = {
+          metadata: {
+            booking_id: bookingId,
+            bookingId,
+            type: 'booking',
+            customer_id: booking.customer_id,
+            provider_id: booking.provider_id,
+            service_name: serviceName
+          }
         };
       }
 
@@ -803,6 +684,16 @@ export function createBookingRoutes(
         console.error('Checkout session missing url or id', { sessionId: session.id, url: session.url });
         return res.status(500).json({ error: 'Stripe checkout session missing url or id' });
       }
+
+      console.log(
+        JSON.stringify({
+          event: 'booking.checkout_session.created',
+          bookingId,
+          amountCents: totalCents,
+          sessionId: session.id,
+          url: session.url
+        })
+      );
 
       res.json({ url: session.url, sessionId: session.id });
     } catch (error) {

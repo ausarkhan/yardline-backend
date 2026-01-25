@@ -24,7 +24,7 @@ export interface DBBooking {
   date: string; // YYYY-MM-DD
   time_start: string; // HH:MM:SS or HH:MM
   time_end: string; // HH:MM:SS or HH:MM
-  status: 'pending' | 'accepted' | 'confirmed' | 'declined' | 'cancelled' | 'expired';
+  status: 'checkout_created' | 'pending' | 'accepted' | 'confirmed' | 'declined' | 'cancelled' | 'expired';
   payment_status: 'none' | 'authorized' | 'captured' | 'canceled' | 'failed' | 'expired';
   payment_intent_id: string | null;
   stripe_checkout_session_id: string | null;
@@ -32,11 +32,6 @@ export interface DBBooking {
   service_price_cents: number | null;
   platform_fee_cents: number | null;
   decline_reason: string | null;
-  // Two-step payment fields
-  deposit_payment_intent_id: string | null;
-  deposit_status: 'unpaid' | 'paid' | 'failed' | 'refunded';
-  final_payment_intent_id: string | null;
-  final_status: 'not_started' | 'paid' | 'failed' | 'refunded';
   created_at: string;
   updated_at: string;
 }
@@ -138,7 +133,7 @@ export async function createBooking(
     date: string;
     time_start: string;
     time_end: string;
-    status: 'pending';
+    status: 'checkout_created' | 'pending';
     payment_status: 'authorized' | 'none';
     payment_intent_id: string | null;
     amount_total: number | null;
@@ -151,7 +146,7 @@ export async function createBooking(
     date: bookingData.date,
     time_start: bookingData.timeStart,
     time_end: bookingData.timeEnd,
-    status: 'pending',
+    status: bookingData.paymentIntentId ? 'pending' : 'checkout_created',
     payment_status: bookingData.paymentIntentId ? 'authorized' : 'none',
     payment_intent_id: bookingData.paymentIntentId,
     amount_total: bookingData.amountTotal,
@@ -348,6 +343,11 @@ export async function acceptBookingTransaction(
     if (booking.status !== 'pending') {
       return { success: false, error: `Booking is ${booking.status}, not pending` };
     }
+
+    // Ensure payment completed before provider acceptance
+    if (booking.payment_status !== 'captured') {
+      return { success: false, error: 'Booking payment not captured yet' };
+    }
     
     // Check for conflicts using SQL function
     const hasConflict = await checkBookingConflict(
@@ -363,13 +363,13 @@ export async function acceptBookingTransaction(
       return { success: false, conflict: true, error: 'Time slot conflict detected' };
     }
     
-    // Update to confirmed - database exclusion constraint will prevent race conditions
+    // Update to accepted - database exclusion constraint will prevent race conditions
     try {
       const updatedBooking = await updateBookingStatus(
         supabase,
         bookingId,
-        'confirmed',
-        'captured'
+        'accepted',
+        booking.payment_status
       );
       return { success: true, booking: updatedBooking };
     } catch (error: any) {
@@ -383,203 +383,4 @@ export async function acceptBookingTransaction(
     console.error('Error in acceptBookingTransaction:', error);
     return { success: false, error: error.message };
   }
-}
-
-// ============================================================================
-// Two-Step Payment Operations (Safe V1)
-// ============================================================================
-
-export async function createBookingWithDeposit(
-  supabase: SupabaseClient,
-  bookingData: {
-    customerId: string;
-    providerId: string;
-    serviceId: string;
-    date: string; // YYYY-MM-DD
-    timeStart: string; // HH:MM:SS or HH:MM
-    timeEnd: string; // HH:MM:SS or HH:MM
-    servicePriceCents: number;
-    platformFeeCents: number;
-    depositPaymentIntentId: string;
-  }
-): Promise<DBBooking> {
-  // Validate time_end > time_start
-  if (bookingData.timeStart >= bookingData.timeEnd) {
-    throw new Error('time_end must be greater than time_start');
-  }
-
-  const insertData = {
-    customer_id: bookingData.customerId,
-    provider_id: bookingData.providerId,
-    service_id: bookingData.serviceId,
-    date: bookingData.date,
-    time_start: bookingData.timeStart,
-    time_end: bookingData.timeEnd,
-    status: 'pending' as const,
-    service_price_cents: bookingData.servicePriceCents,
-    platform_fee_cents: bookingData.platformFeeCents,
-    amount_total: bookingData.platformFeeCents, // Only deposit charged initially
-    deposit_payment_intent_id: bookingData.depositPaymentIntentId,
-    deposit_status: 'paid' as const,
-    final_status: 'not_started' as const,
-    payment_status: 'none' as const, // Legacy field
-    payment_intent_id: null // Legacy field
-  };
-
-  const { data, error } = await supabase
-    .from('bookings')
-    .insert(insertData)
-    .select()
-    .single<DBBooking>();
-
-  if (error) {
-    // Handle exclusion constraint violation
-    if (error.code === '23P01' || error.message?.includes('no_double_booking')) {
-      const conflictError = new Error('Time slot already booked') as any;
-      conflictError.code = 'BOOKING_CONFLICT';
-      conflictError.statusCode = 409;
-      throw conflictError;
-    }
-    throw error;
-  }
-  return data;
-}
-
-export async function acceptBooking(
-  supabase: SupabaseClient,
-  bookingId: string,
-  providerId: string
-): Promise<DBBooking> {
-  // First verify the booking belongs to the provider
-  const booking = await getBooking(supabase, bookingId);
-  
-  if (!booking) {
-    const error = new Error('Booking not found') as any;
-    error.code = 'NOT_FOUND';
-    error.statusCode = 404;
-    throw error;
-  }
-  
-  if (booking.provider_id !== providerId) {
-    const error = new Error('You do not own this booking') as any;
-    error.code = 'FORBIDDEN';
-    error.statusCode = 403;
-    throw error;
-  }
-  
-  if (booking.status !== 'pending') {
-    const error = new Error(`Booking status is ${booking.status}, expected pending`) as any;
-    error.code = 'INVALID_STATUS';
-    error.statusCode = 400;
-    throw error;
-  }
-  
-  if (booking.deposit_status !== 'paid') {
-    const error = new Error('Deposit has not been paid') as any;
-    error.code = 'DEPOSIT_UNPAID';
-    error.statusCode = 400;
-    throw error;
-  }
-  
-  // Update status to accepted
-  const { data, error } = await supabase
-    .from('bookings')
-    .update({
-      status: 'accepted',
-      updated_at: new Date().toISOString()
-    })
-    .eq('id', bookingId)
-    .select()
-    .single<DBBooking>();
-
-  if (error) throw error;
-  return data;
-}
-
-export async function payRemainingBooking(
-  supabase: SupabaseClient,
-  bookingId: string,
-  customerId: string,
-  finalPaymentIntentId: string
-): Promise<DBBooking> {
-  // First verify the booking belongs to the customer
-  const booking = await getBooking(supabase, bookingId);
-  
-  if (!booking) {
-    const error = new Error('Booking not found') as any;
-    error.code = 'NOT_FOUND';
-    error.statusCode = 404;
-    throw error;
-  }
-  
-  if (booking.customer_id !== customerId) {
-    const error = new Error('You do not own this booking') as any;
-    error.code = 'FORBIDDEN';
-    error.statusCode = 403;
-    throw error;
-  }
-  
-  if (booking.status !== 'accepted') {
-    const error = new Error(`Booking status is ${booking.status}, expected accepted`) as any;
-    error.code = 'INVALID_STATUS';
-    error.statusCode = 400;
-    throw error;
-  }
-  
-  if (booking.final_status === 'paid') {
-    const error = new Error('Final payment already completed') as any;
-    error.code = 'ALREADY_PAID';
-    error.statusCode = 400;
-    throw error;
-  }
-  
-  // Update with final payment
-  const { data, error } = await supabase
-    .from('bookings')
-    .update({
-      final_payment_intent_id: finalPaymentIntentId,
-      final_status: 'paid',
-      status: 'confirmed', // Move to confirmed once final payment is complete
-      updated_at: new Date().toISOString()
-    })
-    .eq('id', bookingId)
-    .select()
-    .single<DBBooking>();
-
-  if (error) throw error;
-  return data;
-}
-
-export async function getBookingByDepositPaymentIntent(
-  supabase: SupabaseClient,
-  depositPaymentIntentId: string
-): Promise<DBBooking | null> {
-  const { data, error } = await supabase
-    .from('bookings')
-    .select('*')
-    .eq('deposit_payment_intent_id', depositPaymentIntentId)
-    .single<DBBooking>();
-
-  if (error) {
-    if (error.code === 'PGRST116') return null; // Not found
-    throw error;
-  }
-  return data;
-}
-
-export async function getBookingByFinalPaymentIntent(
-  supabase: SupabaseClient,
-  finalPaymentIntentId: string
-): Promise<DBBooking | null> {
-  const { data, error } = await supabase
-    .from('bookings')
-    .select('*')
-    .eq('final_payment_intent_id', finalPaymentIntentId)
-    .single<DBBooking>();
-
-  if (error) {
-    if (error.code === 'PGRST116') return null; // Not found
-    throw error;
-  }
-  return data;
 }
