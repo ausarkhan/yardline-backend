@@ -702,164 +702,76 @@ export function createBookingRoutes(
       const { bookingId } = req.body;
       const userId = req.user!.id;
 
-      // Validate bookingId
       if (!bookingId) {
-        return res.status(400).json({
-          success: false,
-          error: { type: 'invalid_request_error', message: 'Missing required field: bookingId' }
-        });
+        return res.status(400).json({ error: 'Missing required field: bookingId' });
       }
 
-      // Load booking from database
       const booking = await db.getBooking(supabase, bookingId);
       if (!booking) {
-        return res.status(404).json({
-          success: false,
-          error: { type: 'resource_missing', message: 'Booking not found' }
-        });
+        return res.status(404).json({ error: 'Booking not found' });
       }
 
-      // Authorization: verify user owns this booking (as customer)
       if (booking.customer_id !== userId) {
-        return res.status(403).json({
-          success: false,
-          error: { type: 'permission_denied', message: 'You do not have permission to pay for this booking' }
-        });
+        return res.status(403).json({ error: 'You do not have permission to pay for this booking' });
       }
 
-      // Validate booking is payable
-      if (booking.status === 'cancelled' || booking.status === 'declined') {
-        return res.status(400).json({
-          success: false,
-          error: {
-            type: 'invalid_state',
-            message: `Cannot create checkout session for ${booking.status} booking`,
-            currentStatus: booking.status
-          }
-        });
+      const totalCents =
+        booking.amount_total ??
+        (booking as any).total_cents ??
+        (booking as any).totalCents ??
+        booking.service_price_cents ??
+        null;
+
+      if (!totalCents || totalCents < 50) {
+        return res.status(400).json({ error: 'Booking totalCents must be at least 50' });
       }
 
-      // Check if already paid via checkout session
-      if (booking.stripe_checkout_session_id) {
-        return res.status(400).json({
-          success: false,
-          error: {
-            type: 'already_paid',
-            message: 'Booking already has a checkout session',
-            sessionId: booking.stripe_checkout_session_id
-          }
-        });
-      }
-
-      // Calculate amount server-side (do not accept from client)
-      const totalChargeCents = booking.amount_total || 0;
-
-      // Validate amount
-      if (totalChargeCents < 50) {
-        return res.status(400).json({
-          success: false,
-          error: { type: 'invalid_request_error', message: 'Amount must be at least $0.50 USD', code: 'amount_too_small' }
-        });
-      }
-
-      // Review mode guardrail
-      if (REVIEW_MODE && totalChargeCents > REVIEW_MODE_MAX_CHARGE_CENTS) {
-        return res.status(400).json({
-          success: false,
-          error: {
-            type: 'review_mode_error',
-            message: `Review mode is enabled. Maximum charge is $${REVIEW_MODE_MAX_CHARGE_CENTS / 100}`,
-            code: 'review_mode_limit_exceeded'
-          }
-        });
-      }
-
-      // Get service details for description
-      let serviceName = 'Service';
-      if (booking.service_id) {
+      let serviceName = (booking as any).service_name as string | undefined;
+      if (!serviceName && booking.service_id) {
         const service = await db.getService(supabase, booking.service_id);
         if (service) {
           serviceName = service.name;
         }
       }
+      if (!serviceName) {
+        serviceName = 'Service';
+      }
 
-      // Get APP_URL_SCHEME from environment (default to 'yardline')
-      // Production uses 'yardline://', dev/preview uses 'vibecode://'
-      const APP_URL_SCHEME = process.env.APP_URL_SCHEME || 'yardline';
-
-      // Create Stripe Checkout Session
       const sessionParams: Stripe.Checkout.SessionCreateParams = {
         mode: 'payment',
+        payment_method_types: ['card'],
         line_items: [
           {
             price_data: {
               currency: 'usd',
+              unit_amount: totalCents,
               product_data: {
-                name: `YardLine Booking: ${serviceName}`,
-                description: `${booking.date} at ${booking.time_start}`,
-              },
-              unit_amount: totalChargeCents,
+                name: serviceName
+              }
             },
-            quantity: 1,
-          },
+            quantity: 1
+          }
         ],
+        success_url: `vibecode://payment-success?type=booking&session_id={CHECKOUT_SESSION_ID}&booking_id=${bookingId}`,
+        cancel_url: `vibecode://payment-cancel?type=booking&booking_id=${bookingId}`,
         metadata: {
-          bookingId: booking.id,
-          type: 'booking',
-          customerId: booking.customer_id,
-          providerId: booking.provider_id,
-          serviceId: booking.service_id || '',
-          date: booking.date,
-          timeStart: booking.time_start,
-          mode: 'live'
-        },
-        success_url: `${APP_URL_SCHEME}://payment-success?type=booking&session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${APP_URL_SCHEME}://payment-cancel?type=booking&bookingId=${booking.id}`,
+          bookingId
+        }
       };
 
-      // If provider has connected account, configure transfer
-      if (booking.provider_id) {
-        try {
-          const providerAccountId = await getOrCreateStripeAccountId(
-            booking.provider_id,
-            `provider-${booking.provider_id}@yardline.app`,
-            `Provider ${booking.provider_id}`
-          );
+      const providerStripeAccountId =
+        (booking as any).provider_stripe_account_id ||
+        (booking as any).providerStripeAccountId ||
+        null;
 
-          // Configure Connect transfer (Model A: provider gets service price)
-          sessionParams.payment_intent_data = {
-            transfer_data: {
-              destination: providerAccountId
-            },
-            application_fee_amount: booking.service_price_cents || 0,
-            metadata: sessionParams.metadata
-          };
-        } catch (connectError) {
-          console.error('Error setting up Connect transfer for booking checkout:', connectError);
-          // Continue without Connect transfer - payment will still work
-        }
-      }
+      const session = providerStripeAccountId
+        ? await stripe.checkout.sessions.create(sessionParams, { stripeAccount: providerStripeAccountId })
+        : await stripe.checkout.sessions.create(sessionParams);
 
-      // Create session with idempotency
-      const idempotencyKey = `checkout_booking_${bookingId}_${Date.now()}`;
-      const session = await stripe.checkout.sessions.create(sessionParams, { idempotencyKey });
-
-      console.log(`✅ Created Checkout Session ${session.id} for booking ${bookingId}`);
-      console.log(`   Amount: $${(totalChargeCents / 100).toFixed(2)}, Service: ${serviceName}`);
-
-      res.json({
-        success: true,
-        data: {
-          url: session.url,
-          sessionId: session.id
-        }
-      });
-    } catch (error: any) {
+      res.json({ url: session.url, sessionId: session.id });
+    } catch (error) {
       console.error('Error creating checkout session for booking:', error);
-      res.status(500).json({
-        success: false,
-        error: { type: 'api_error', message: error.message || 'Failed to create checkout session' }
-      });
+      res.status(500).json({ error: 'Failed to create checkout session' });
     }
   });
 
