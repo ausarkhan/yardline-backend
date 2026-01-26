@@ -70,6 +70,58 @@ export function createCheckoutSessionHandler(params: {
     try {
       const { bookingId, serviceName: requestServiceName } = req.body;
       const userId = req.user?.id;
+      const correlationId =
+        (typeof req.headers['x-request-id'] === 'string' && req.headers['x-request-id']) ||
+        (typeof req.headers['x-correlation-id'] === 'string' && req.headers['x-correlation-id']) ||
+        uuidv4();
+
+      const stripeEnv = process.env.STRIPE_ENV;
+      const appUrlScheme = process.env.APP_URL_SCHEME;
+      const stripeSecretKey =
+        stripeEnv === 'live'
+          ? process.env.STRIPE_LIVE_SECRET_KEY
+          : stripeEnv === 'test'
+            ? process.env.STRIPE_TEST_SECRET_KEY
+            : undefined;
+      const webhookSecret =
+        stripeEnv === 'live'
+          ? process.env.STRIPE_LIVE_WEBHOOK_SECRET
+          : stripeEnv === 'test'
+            ? process.env.STRIPE_TEST_WEBHOOK_SECRET
+            : undefined;
+
+      const missingEnvMessages: string[] = [];
+      if (!stripeEnv) missingEnvMessages.push('Missing STRIPE_ENV');
+      if (stripeEnv && stripeEnv !== 'live' && stripeEnv !== 'test') {
+        missingEnvMessages.push('Invalid STRIPE_ENV (expected "live" or "test")');
+      }
+      if (!stripeSecretKey) {
+        missingEnvMessages.push(
+          stripeEnv === 'test' ? 'Missing STRIPE_TEST_SECRET_KEY' : 'Missing STRIPE_LIVE_SECRET_KEY'
+        );
+      }
+      if (!appUrlScheme) missingEnvMessages.push('Missing APP_URL_SCHEME');
+      if (!webhookSecret) {
+        missingEnvMessages.push(
+          stripeEnv === 'test'
+            ? 'Missing STRIPE_TEST_WEBHOOK_SECRET'
+            : 'Missing STRIPE_LIVE_WEBHOOK_SECRET'
+        );
+      }
+
+      if (missingEnvMessages.length > 0) {
+        console.error('[BOOKING_CHECKOUT_ENV_MISSING]', {
+          correlationId,
+          bookingId: typeof bookingId === 'string' ? bookingId : null,
+          userId,
+          stripeEnv,
+          missing: missingEnvMessages
+        });
+        return res.status(500).json({
+          code: 'BOOKING_CHECKOUT_ENV_MISSING',
+          message: missingEnvMessages.join('; ')
+        });
+      }
 
       if (!bookingId || typeof bookingId !== 'string') {
         logCheckoutDecision({
@@ -82,7 +134,7 @@ export function createCheckoutSessionHandler(params: {
         });
       }
 
-      console.log('[BOOKING_CHECKOUT_REQUEST]', { bookingId, userId });
+      console.log('[BOOKING_CHECKOUT_REQUEST]', { bookingId, userId, correlationId });
 
       const booking = await dbClient.getBooking(supabase, bookingId);
       if (!booking) {
@@ -233,7 +285,6 @@ export function createCheckoutSessionHandler(params: {
         });
       }
 
-      const appUrlScheme = process.env.APP_URL_SCHEME || 'yardline';
       const sessionParams: Stripe.Checkout.SessionCreateParams = {
         mode: 'payment',
         payment_method_types: ['card'],
@@ -274,12 +325,14 @@ export function createCheckoutSessionHandler(params: {
         );
       }
 
+      let applicationFeeAmount: number | null = null;
       if (providerStripeAccountId) {
         const platformFeeCents =
           booking.platform_fee_cents ??
           (booking as any).platformFeeCents ??
           null;
         const applicationFee = typeof platformFeeCents === 'number' ? platformFeeCents : Number(platformFeeCents);
+        applicationFeeAmount = Number.isInteger(applicationFee) && applicationFee > 0 ? applicationFee : null;
 
         sessionParams.payment_intent_data = {
           transfer_data: {
@@ -293,7 +346,7 @@ export function createCheckoutSessionHandler(params: {
             provider_id: booking.provider_id,
             service_name: normalizedDisplayName
           },
-          ...(Number.isInteger(applicationFee) && applicationFee > 0
+          ...(applicationFeeAmount !== null
             ? { application_fee_amount: applicationFee }
             : {})
         };
@@ -310,7 +363,42 @@ export function createCheckoutSessionHandler(params: {
         };
       }
 
-      const session = await stripe.checkout.sessions.create(sessionParams);
+      console.log('[BOOKING_CHECKOUT_STRIPE_PARAMS]', {
+        correlationId,
+        bookingId,
+        userId,
+        providerId: booking.provider_id,
+        amountCents: totalCents,
+        currency: sessionParams.line_items?.[0]?.price_data?.currency,
+        success_url: sessionParams.success_url,
+        cancel_url: sessionParams.cancel_url,
+        destinationAccountId: providerStripeAccountId,
+        application_fee_amount: applicationFeeAmount
+      });
+
+      let session: Stripe.Checkout.Session;
+      try {
+        session = await stripe.checkout.sessions.create(sessionParams);
+      } catch (err: any) {
+        console.error('[BOOKING_CHECKOUT_STRIPE_ERROR]', {
+          correlationId,
+          bookingId,
+          userId,
+          providerId: booking.provider_id,
+          message: err?.message,
+          type: err?.type,
+          code: err?.code,
+          param: err?.param,
+          statusCode: err?.statusCode,
+          requestId: err?.requestId,
+          raw: err
+        });
+
+        return res.status(500).json({
+          code: 'BOOKING_CHECKOUT_FAILED',
+          message: err?.message || 'Stripe Checkout creation failed'
+        });
+      }
 
       if (!session.url || !session.id) {
         console.error('[BOOKING_CHECKOUT_ERROR]', {
