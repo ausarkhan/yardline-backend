@@ -11,6 +11,7 @@ import Stripe from 'stripe';
 import { v4 as uuidv4 } from 'uuid';
 import * as db from '../db';
 import { authenticateUser } from '../middleware/auth';
+import { resolveBookingServiceDetails } from './bookingServiceResolver';
 
 export function createBookingRoutes(
   supabase: SupabaseClient,
@@ -95,7 +96,12 @@ export function createBookingRoutes(
         timeStart, // HH:MM:SS or HH:MM
         timeEnd, // HH:MM:SS or HH:MM (optional if service selected)
         customerEmail,
-        customerName
+        customerName,
+        providerId: requestProviderId,
+        serviceName,
+        servicePriceCents,
+        serviceDurationMinutes,
+        priceCents
       } = req.body;
 
       const customerId = req.user!.id;
@@ -109,54 +115,35 @@ export function createBookingRoutes(
       }
 
       let providerId: string;
-      let servicePriceCents: number;
+      let resolvedServicePriceCents: number;
       let calculatedTimeEnd: string;
+      let resolvedServiceId: string | null;
 
-      // If service is selected, get service details and calculate end time
-      if (serviceId) {
-        const service = await db.getService(supabase, serviceId);
-        if (!service) {
-          return res.status(404).json({
-            success: false,
-            error: { type: 'resource_missing', message: 'Service not found' }
-          });
-        }
+      const serviceRecord = serviceId ? await db.getService(supabase, serviceId) : null;
 
-        if (!service.active) {
-          return res.status(400).json({
-            success: false,
-            error: { type: 'invalid_request_error', message: 'Service is not available' }
-          });
-        }
+      const resolution = resolveBookingServiceDetails({
+        serviceId,
+        serviceRecord,
+        providerId: requestProviderId,
+        timeStart,
+        timeEnd,
+        serviceName,
+        servicePriceCents,
+        serviceDurationMinutes,
+        customPriceCents: priceCents
+      });
 
-        providerId = service.provider_id;
-        servicePriceCents = service.price_cents;
-
-        // Calculate end time from service duration if not provided
-        if (timeEnd) {
-          calculatedTimeEnd = timeEnd;
-        } else {
-          // Parse time and add duration
-          const [hours, minutes] = timeStart.split(':').map(Number);
-          const startMinutes = hours * 60 + minutes;
-          const endMinutes = startMinutes + service.duration;
-          const endHours = Math.floor(endMinutes / 60);
-          const endMins = endMinutes % 60;
-          calculatedTimeEnd = `${String(endHours).padStart(2, '0')}:${String(endMins).padStart(2, '0')}:00`;
-        }
-      } else {
-        // For custom bookings without service, require providerId, timeEnd, and priceCents
-        const { providerId: customProviderId, priceCents } = req.body;
-        if (!customProviderId || !timeEnd || typeof priceCents !== 'number') {
-          return res.status(400).json({
-            success: false,
-            error: { type: 'invalid_request_error', message: 'For custom bookings: providerId, timeEnd, and priceCents are required' }
-          });
-        }
-        providerId = customProviderId;
-        servicePriceCents = priceCents;
-        calculatedTimeEnd = timeEnd;
+      if (!resolution.ok) {
+        return res.status(resolution.error.status).json({
+          success: false,
+          error: { type: resolution.error.type, message: resolution.error.message }
+        });
       }
+
+      providerId = resolution.data.providerId;
+      resolvedServicePriceCents = resolution.data.servicePriceCents;
+      calculatedTimeEnd = resolution.data.calculatedTimeEnd;
+      resolvedServiceId = resolution.data.serviceId;
 
       // Validate time_end > time_start
       if (timeStart >= calculatedTimeEnd) {
@@ -196,8 +183,8 @@ export function createBookingRoutes(
 
       // Calculate server-side pricing with platform fee formula
       // platformFee = max(99, min(round(0.08 * price_after_discount), 1299))
-      const platformFeeCents = Math.max(99, Math.min(Math.round(0.08 * servicePriceCents), 1299));
-      const totalChargeCents = servicePriceCents + platformFeeCents;
+      const platformFeeCents = Math.max(99, Math.min(Math.round(0.08 * resolvedServicePriceCents), 1299));
+      const totalChargeCents = resolvedServicePriceCents + platformFeeCents;
 
       // Minimum charge validation
       if (totalChargeCents < 50) {
@@ -233,13 +220,13 @@ export function createBookingRoutes(
         const booking = await db.createBooking(supabase, {
           customerId,
           providerId,
-          serviceId: serviceId || null,
+          serviceId: resolvedServiceId,
           date,
           timeStart,
           timeEnd: calculatedTimeEnd,
           paymentIntentId: null,
           amountTotal: totalChargeCents,
-          servicePriceCents,
+          servicePriceCents: resolvedServicePriceCents,
           platformFeeCents
         });
 
