@@ -24,7 +24,7 @@ export interface DBBooking {
   date: string; // YYYY-MM-DD
   time_start: string; // HH:MM:SS or HH:MM
   time_end: string; // HH:MM:SS or HH:MM
-  status: 'pending' | 'accepted' | 'confirmed' | 'declined' | 'cancelled' | 'expired';
+  status: 'pending' | 'checkout_created' | 'accepted' | 'confirmed' | 'declined' | 'cancelled' | 'expired';
   payment_status: 'none' | 'authorized' | 'captured' | 'canceled' | 'failed' | 'expired';
   payment_intent_id: string | null;
   stripe_checkout_session_id: string | null;
