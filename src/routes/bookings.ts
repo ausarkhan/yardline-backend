@@ -68,7 +68,7 @@ export function createCheckoutSessionHandler(params: {
 
   return async (req: Request, res: Response) => {
     try {
-      const { bookingId } = req.body;
+      const { bookingId, serviceName: requestServiceName } = req.body;
       const userId = req.user?.id;
 
       if (!bookingId || typeof bookingId !== 'string') {
@@ -215,14 +215,12 @@ export function createCheckoutSessionHandler(params: {
         });
       }
 
-      let serviceName = (booking as any).service_name as string | undefined;
-      if (!serviceName && booking.service_id) {
-        const service = await dbClient.getService(supabase, booking.service_id);
-        if (service) {
-          serviceName = service.name;
-        }
-      }
-      if (!serviceName || typeof serviceName !== 'string') {
+      const displayName = (typeof requestServiceName === 'string' ? requestServiceName : undefined) ??
+        ((booking as any).service_name as string | undefined) ??
+        'Booking Service';
+      const normalizedDisplayName = displayName.trim();
+
+      if (!normalizedDisplayName) {
         logCheckoutDecision({
           bookingId,
           paymentStatus,
@@ -231,7 +229,7 @@ export function createCheckoutSessionHandler(params: {
         });
         return res.status(400).json({
           error: 'INVALID_REQUEST',
-          message: 'Booking serviceName is missing or invalid'
+          message: 'serviceName is missing or invalid'
         });
       }
 
@@ -245,7 +243,7 @@ export function createCheckoutSessionHandler(params: {
               currency: 'usd',
               unit_amount: totalCents,
               product_data: {
-                name: serviceName
+                name: normalizedDisplayName
               }
             },
             quantity: 1
@@ -258,7 +256,7 @@ export function createCheckoutSessionHandler(params: {
           bookingId,
           userId: booking.customer_id,
           providerId: booking.provider_id,
-          serviceName
+          serviceName: normalizedDisplayName
         }
       };
 
@@ -293,7 +291,7 @@ export function createCheckoutSessionHandler(params: {
             type: 'booking',
             customer_id: booking.customer_id,
             provider_id: booking.provider_id,
-            service_name: serviceName
+            service_name: normalizedDisplayName
           },
           ...(Number.isInteger(applicationFee) && applicationFee > 0
             ? { application_fee_amount: applicationFee }
@@ -307,7 +305,7 @@ export function createCheckoutSessionHandler(params: {
             type: 'booking',
             customer_id: booking.customer_id,
             provider_id: booking.provider_id,
-            service_name: serviceName
+            service_name: normalizedDisplayName
           }
         };
       }
