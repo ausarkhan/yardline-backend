@@ -97,6 +97,26 @@ test('checkout-session allows payment_status "unpaid"', async () => {
   assert.ok(response.body.sessionId);
 });
 
+test('checkout-session allows payment_status null or undefined', async () => {
+  const booking = createBooking({ payment_status: null });
+  const handler = createCheckoutSessionHandler({
+    supabase: createSupabaseMock(),
+    stripe: createStripeMock('https://checkout.example/null', 'cs_null'),
+    getOrCreateStripeAccountId: async () => 'acct_123',
+    dbClient: {
+      getBooking: async () => booking,
+      getService: async () => ({ name: 'Training Session' } as any)
+    }
+  });
+
+  const { res, response } = createRes();
+  await handler({ body: { bookingId: booking.id }, user: { id: booking.customer_id } } as any, res);
+
+  assert.equal(response.statusCode, 200);
+  assert.ok(response.body.url);
+  assert.ok(response.body.sessionId);
+});
+
 test('checkout-session rejects payment_status "paid"', async () => {
   const booking = createBooking({ payment_status: 'paid' });
   const handler = createCheckoutSessionHandler({
