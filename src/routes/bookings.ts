@@ -76,19 +76,25 @@ export function createCheckoutSessionHandler(params: {
         uuidv4();
 
       const stripeEnv = process.env.STRIPE_ENV;
+      const isLive = stripeEnv === 'live';
+      const isTest = stripeEnv === 'test';
       const appUrlScheme = process.env.APP_URL_SCHEME;
-      const stripeSecretKey =
-        stripeEnv === 'live'
-          ? process.env.STRIPE_LIVE_SECRET_KEY
-          : stripeEnv === 'test'
-            ? process.env.STRIPE_TEST_SECRET_KEY
-            : undefined;
-      const webhookSecret =
-        stripeEnv === 'live'
-          ? process.env.STRIPE_LIVE_WEBHOOK_SECRET
-          : stripeEnv === 'test'
-            ? process.env.STRIPE_TEST_WEBHOOK_SECRET
-            : undefined;
+      const stripeSecretKey = isLive
+        ? process.env.STRIPE_LIVE_SECRET_KEY
+        : isTest
+          ? process.env.STRIPE_TEST_SECRET_KEY
+          : undefined;
+      const webhookSecret = isLive
+        ? process.env.STRIPE_LIVE_WEBHOOK_SECRET
+        : isTest
+          ? process.env.STRIPE_TEST_WEBHOOK_SECRET
+          : undefined;
+
+      console.log('[STRIPE_ENV_RESOLVED]', {
+        stripeEnv,
+        hasLiveKey: !!process.env.STRIPE_LIVE_SECRET_KEY,
+        hasLiveWebhook: !!process.env.STRIPE_LIVE_WEBHOOK_SECRET
+      });
 
       const missingEnvMessages: string[] = [];
       if (!stripeEnv) missingEnvMessages.push('Missing STRIPE_ENV');
