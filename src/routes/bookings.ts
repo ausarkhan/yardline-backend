@@ -120,7 +120,10 @@ export function createBookingRoutes(
 
 
   // POST /v1/bookings/pay-online - Create booking + Stripe Checkout Session (single call)
-  router.post('/bookings/pay-online', authenticateUser(supabase), async (req, res) => {
+  router.post(
+    '/bookings/pay-online',
+    authenticateUser(supabase, { responseFormat: 'simple' }),
+    async (req, res) => {
     try {
       const {
         providerUserId,
@@ -134,47 +137,45 @@ export function createBookingRoutes(
 
       const customerUserId = req.user!.id;
 
-      console.log('[BOOKING_PAY_ONLINE_REQUEST]');
-
       if (!providerUserId || typeof providerUserId !== 'string' || !isValidUuid(providerUserId)) {
         return res.status(400).json({
-          success: false,
-          error: { type: 'invalid_request_error', message: 'providerUserId must be a valid UUID' }
+          error: 'INVALID_REQUEST',
+          message: 'providerUserId must be a valid UUID'
         });
       }
 
       if (!serviceId || typeof serviceId !== 'string' || serviceId.trim().length === 0) {
         return res.status(400).json({
-          success: false,
-          error: { type: 'invalid_request_error', message: 'serviceId must be a non-empty string' }
+          error: 'INVALID_REQUEST',
+          message: 'serviceId must be a non-empty string'
         });
       }
 
       if (!serviceName || typeof serviceName !== 'string' || serviceName.trim().length === 0) {
         return res.status(400).json({
-          success: false,
-          error: { type: 'invalid_request_error', message: 'serviceName must be a non-empty string' }
+          error: 'INVALID_REQUEST',
+          message: 'serviceName must be a non-empty string'
         });
       }
 
       if (!Number.isInteger(servicePriceCents) || servicePriceCents <= 0) {
         return res.status(400).json({
-          success: false,
-          error: { type: 'invalid_request_error', message: 'servicePriceCents must be a positive integer' }
+          error: 'INVALID_REQUEST',
+          message: 'servicePriceCents must be a positive integer'
         });
       }
 
       if (!Number.isInteger(serviceDurationMinutes) || serviceDurationMinutes <= 0) {
         return res.status(400).json({
-          success: false,
-          error: { type: 'invalid_request_error', message: 'serviceDurationMinutes must be a positive integer' }
+          error: 'INVALID_REQUEST',
+          message: 'serviceDurationMinutes must be a positive integer'
         });
       }
 
       if (!startTime || typeof startTime !== 'string' || !endTime || typeof endTime !== 'string') {
         return res.status(400).json({
-          success: false,
-          error: { type: 'invalid_request_error', message: 'startTime and endTime must be valid ISO strings' }
+          error: 'INVALID_REQUEST',
+          message: 'startTime and endTime must be valid ISO strings'
         });
       }
 
@@ -183,15 +184,15 @@ export function createBookingRoutes(
 
       if (!startDate || !endDate) {
         return res.status(400).json({
-          success: false,
-          error: { type: 'invalid_request_error', message: 'startTime and endTime must be valid ISO strings' }
+          error: 'INVALID_REQUEST',
+          message: 'startTime and endTime must be valid ISO strings'
         });
       }
 
       if (endDate <= startDate) {
         return res.status(400).json({
-          success: false,
-          error: { type: 'invalid_request_error', message: 'endTime must be after startTime' }
+          error: 'INVALID_REQUEST',
+          message: 'endTime must be after startTime'
         });
       }
 
@@ -200,8 +201,8 @@ export function createBookingRoutes(
 
       if (startDateStr !== endDateStr) {
         return res.status(400).json({
-          success: false,
-          error: { type: 'invalid_request_error', message: 'startTime and endTime must be on the same day' }
+          error: 'INVALID_REQUEST',
+          message: 'startTime and endTime must be on the same day'
         });
       }
 
@@ -211,8 +212,8 @@ export function createBookingRoutes(
 
       if (providerUserError || !providerUser?.user) {
         return res.status(400).json({
-          success: false,
-          error: { type: 'invalid_request_error', message: 'providerUserId must reference an existing user' }
+          error: 'INVALID_PROVIDER',
+          message: 'providerUserId must reference an existing user'
         });
       }
 
@@ -246,22 +247,28 @@ export function createBookingRoutes(
       if (bookingError) {
         if (bookingError.code === '23P01' || bookingError.message?.includes('no_double_booking')) {
           return res.status(409).json({
-            success: false,
-            error: { type: 'booking_conflict', message: 'Time slot already booked' }
+            error: 'BOOKING_CONFLICT',
+            message: 'Time slot already booked'
           });
         }
         console.error('[BOOKING_PAY_ONLINE_ERROR] Failed to create booking:', bookingError);
-        return res.status(500).json({ success: false, error: 'Booking pay online failed' });
+        return res.status(500).json({
+          error: 'BOOKING_CREATE_FAILED',
+          message: 'Booking pay online failed'
+        });
       }
 
       if (!booking?.id) {
         console.error('[BOOKING_PAY_ONLINE_ERROR] Booking creation failed: missing booking id');
-        return res.status(500).json({ success: false, error: 'Booking pay online failed' });
+        return res.status(500).json({
+          error: 'BOOKING_CREATE_FAILED',
+          message: 'Booking pay online failed'
+        });
       }
 
       const bookingId = booking.id as string;
 
-      console.log('[BOOKING_PAY_ONLINE_CREATED]', bookingId);
+      console.log('[BOOKING_CHECKOUT_REQUEST]', { bookingId, userId: customerUserId });
 
       const appUrlScheme = process.env.APP_URL_SCHEME || 'yardline';
       const sessionParams: Stripe.Checkout.SessionCreateParams = {
@@ -312,12 +319,18 @@ export function createBookingRoutes(
 
       if (!session.url || !session.id) {
         console.error('[BOOKING_PAY_ONLINE_ERROR] Stripe checkout session missing url or id');
-        return res.status(500).json({ success: false, error: 'Booking pay online failed' });
+        return res.status(500).json({
+          error: 'STRIPE_SESSION_INVALID',
+          message: 'Stripe session missing url or id'
+        });
       }
 
       if (!bookingId || !session.url) {
         console.error('[BOOKING_PAY_ONLINE_ERROR] Missing bookingId or session url');
-        return res.status(500).json({ success: false, error: 'Booking pay online failed' });
+        return res.status(500).json({
+          error: 'BOOKING_CHECKOUT_INVALID',
+          message: 'Booking pay online failed'
+        });
       }
 
       const { error: updateError } = await supabase
@@ -333,18 +346,22 @@ export function createBookingRoutes(
       }
 
       console.log('[BOOKING_PAY_ONLINE_CHECKOUT]', bookingId, session.id);
+      console.log('[BOOKING_CHECKOUT_SUCCESS]', { bookingId, sessionId: session.id });
 
       return res.status(200).json({
-        success: true,
-        data: {
-          bookingId,
-          sessionId: session.id,
-          url: session.url
-        }
+        bookingId,
+        sessionId: session.id,
+        url: session.url
       });
     } catch (error) {
-      console.error('[BOOKING_PAY_ONLINE_ERROR]', error);
-      return res.status(500).json({ success: false, error: 'Booking pay online failed' });
+      console.error('[BOOKING_CHECKOUT_ERROR]', {
+        error,
+        stack: error instanceof Error ? error.stack : undefined
+      });
+      return res.status(500).json({
+        error: 'BOOKING_CHECKOUT_FAILED',
+        message: 'Booking pay online failed'
+      });
     }
   });
       // Validate required fields
@@ -772,34 +789,49 @@ export function createBookingRoutes(
   });
 
   // POST /v1/bookings/checkout-session - Create Stripe Checkout Session for existing booking
-  router.post('/bookings/checkout-session', authenticateUser(supabase), async (req, res) => {
+  router.post(
+    '/bookings/checkout-session',
+    authenticateUser(supabase, { responseFormat: 'simple' }),
+    async (req, res) => {
     try {
       const { bookingId } = req.body;
       const userId = req.user!.id;
 
       if (!bookingId || typeof bookingId !== 'string') {
-        return res.status(400).json({ error: 'Missing or invalid required field: bookingId' });
+        return res.status(400).json({
+          error: 'INVALID_REQUEST',
+          message: 'Missing or invalid required field: bookingId'
+        });
       }
+
+      console.log('[BOOKING_CHECKOUT_REQUEST]', { bookingId, userId });
 
       const booking = await db.getBooking(supabase, bookingId);
       if (!booking) {
-        return res.status(404).json({ error: 'Booking not found' });
+        return res.status(404).json({
+          error: 'BOOKING_NOT_FOUND',
+          message: 'Booking not found'
+        });
       }
 
       if (booking.customer_id !== userId) {
-        return res.status(403).json({ error: 'You do not have permission to pay for this booking' });
+        return res.status(403).json({
+          error: 'FORBIDDEN',
+          message: 'You do not have permission to pay for this booking'
+        });
       }
 
       if (booking.status !== 'checkout_created') {
         return res.status(409).json({
-          error: 'Payment is only available for unpaid bookings.'
+          error: 'INVALID_STATE',
+          message: 'Payment is only available for unpaid bookings.'
         });
       }
 
       if (booking.payment_status === 'captured') {
         return res.status(409).json({
-          error: 'Booking payment already completed',
-          code: 'already_paid'
+          error: 'ALREADY_PAID',
+          message: 'Booking payment already completed'
         });
       }
 
@@ -809,19 +841,30 @@ export function createBookingRoutes(
         );
 
         if (!existingSession.url || !existingSession.id) {
-          console.error('Existing checkout session missing url or id', {
+          console.error('[BOOKING_CHECKOUT_ERROR]', {
+            error: 'Stripe checkout session missing url or id',
             sessionId: existingSession.id,
             url: existingSession.url
           });
-          return res.status(500).json({ error: 'Stripe checkout session missing url or id' });
+          return res.status(500).json({
+            error: 'STRIPE_SESSION_INVALID',
+            message: 'Stripe session missing url or id'
+          });
         }
 
-        return res.json({
-          success: true,
-          data: {
-            url: existingSession.url,
-            sessionId: existingSession.id
-          }
+        if (!bookingId || !existingSession.url) {
+          return res.status(500).json({
+            error: 'BOOKING_CHECKOUT_INVALID',
+            message: 'Stripe session missing url'
+          });
+        }
+
+        console.log('[BOOKING_CHECKOUT_SUCCESS]', { bookingId, sessionId: existingSession.id });
+
+        return res.status(200).json({
+          url: existingSession.url,
+          sessionId: existingSession.id,
+          bookingId
         });
       }
 
@@ -836,11 +879,17 @@ export function createBookingRoutes(
       const totalCents = typeof totalCentsRaw === 'number' ? totalCentsRaw : Number(totalCentsRaw);
 
       if (!Number.isInteger(totalCents)) {
-        return res.status(400).json({ error: 'Booking totalCents must be an integer' });
+        return res.status(400).json({
+          error: 'INVALID_REQUEST',
+          message: 'Booking totalCents must be an integer'
+        });
       }
 
       if (totalCents < 50) {
-        return res.status(400).json({ error: 'Booking totalCents must be at least 50' });
+        return res.status(400).json({
+          error: 'INVALID_REQUEST',
+          message: 'Booking totalCents must be at least 50'
+        });
       }
 
       let serviceName = (booking as any).service_name as string | undefined;
@@ -851,7 +900,10 @@ export function createBookingRoutes(
         }
       }
       if (!serviceName || typeof serviceName !== 'string') {
-        return res.status(400).json({ error: 'Booking serviceName is missing or invalid' });
+        return res.status(400).json({
+          error: 'INVALID_REQUEST',
+          message: 'Booking serviceName is missing or invalid'
+        });
       }
 
       const appUrlScheme = process.env.APP_URL_SCHEME || 'yardline';
@@ -934,8 +986,22 @@ export function createBookingRoutes(
       const session = await stripe.checkout.sessions.create(sessionParams);
 
       if (!session.url || !session.id) {
-        console.error('Checkout session missing url or id', { sessionId: session.id, url: session.url });
-        return res.status(500).json({ error: 'Stripe checkout session missing url or id' });
+        console.error('[BOOKING_CHECKOUT_ERROR]', {
+          error: 'Stripe checkout session missing url or id',
+          sessionId: session.id,
+          url: session.url
+        });
+        return res.status(500).json({
+          error: 'STRIPE_SESSION_INVALID',
+          message: 'Stripe session missing url or id'
+        });
+      }
+
+      if (!bookingId || !session.url) {
+        return res.status(500).json({
+          error: 'BOOKING_CHECKOUT_INVALID',
+          message: 'Stripe session missing url'
+        });
       }
 
       const { error: updateError } = await supabase
@@ -948,7 +1014,10 @@ export function createBookingRoutes(
 
       if (updateError) {
         console.error('Failed to store checkout session ID on booking:', updateError);
-        return res.status(500).json({ error: 'Failed to persist checkout session' });
+        return res.status(500).json({
+          error: 'BOOKING_CHECKOUT_PERSIST_FAILED',
+          message: 'Failed to persist checkout session'
+        });
       }
 
       console.log(
@@ -961,22 +1030,22 @@ export function createBookingRoutes(
         })
       );
 
-      res.json({
-        success: true,
-        data: {
-          url: session.url,
-          sessionId: session.id
-        }
+      console.log('[BOOKING_CHECKOUT_SUCCESS]', { bookingId, sessionId: session.id });
+
+      return res.status(200).json({
+        url: session.url,
+        sessionId: session.id,
+        bookingId
       });
     } catch (error) {
-      const stripeError = error as any;
-      console.error('Error creating checkout session for booking:', {
-        message: stripeError?.message,
-        type: stripeError?.type,
-        code: stripeError?.code,
-        raw: stripeError?.raw
+      console.error('[BOOKING_CHECKOUT_ERROR]', {
+        error,
+        stack: error instanceof Error ? error.stack : undefined
       });
-      res.status(500).json({ error: 'Failed to create checkout session' });
+      return res.status(500).json({
+        error: 'BOOKING_CHECKOUT_FAILED',
+        message: 'Failed to create checkout session'
+      });
     }
   });
 

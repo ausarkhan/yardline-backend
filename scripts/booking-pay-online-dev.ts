@@ -20,12 +20,14 @@ async function apiFetch(path: string, options: RequestInit = {}) {
   const res = await fetch(`${API_BASE_URL}${path}`, options);
   const text = await res.text();
   let json: any = null;
+  let isJson = true;
   try {
     json = JSON.parse(text);
   } catch {
     json = { raw: text };
+    isJson = false;
   }
-  return { status: res.status, json };
+  return { status: res.status, json, isJson, raw: text };
 }
 
 function buildWebhookPayload(sessionId: string, paymentStatus: 'paid' | 'unpaid') {
@@ -52,6 +54,27 @@ function buildWebhookPayload(sessionId: string, paymentStatus: 'paid' | 'unpaid'
 async function main() {
   console.log('=== Booking Pay Online Dev Script ===');
 
+  const invalidResp = await apiFetch('/v1/bookings/checkout-session', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${CUSTOMER_TOKEN}`
+    },
+    body: JSON.stringify({})
+  });
+
+  console.log('Invalid request response:', invalidResp.status, invalidResp.json);
+
+  if (invalidResp.status < 400) {
+    console.error('Expected 4xx response for invalid request.');
+    process.exit(1);
+  }
+
+  if (!invalidResp.isJson || !invalidResp.json?.error || !invalidResp.json?.message) {
+    console.error('Invalid request did not return JSON error/message.');
+    process.exit(1);
+  }
+
   // 1) Create checkout session (returns URL)
   const checkoutResp = await apiFetch('/v1/bookings/checkout-session', {
     method: 'POST',
@@ -63,6 +86,11 @@ async function main() {
   });
 
   console.log('Checkout session response:', checkoutResp.status, checkoutResp.json);
+
+  if (!checkoutResp.isJson || !checkoutResp.json?.url || !checkoutResp.json?.sessionId) {
+    console.error('Checkout session response is missing JSON url/sessionId.');
+    process.exit(1);
+  }
   const sessionId = checkoutResp.json?.sessionId;
 
   if (!sessionId) {

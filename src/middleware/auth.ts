@@ -18,19 +18,34 @@ declare global {
  * Middleware to verify Supabase JWT token
  * Expects Authorization header: Bearer <token>
  */
-export function authenticateUser(supabase: SupabaseClient) {
+export function authenticateUser(
+  supabase: SupabaseClient,
+  options?: { responseFormat?: 'simple' | 'detailed' }
+) {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
       const authHeader = req.headers.authorization;
-      
-      if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({
+
+      const useSimple = options?.responseFormat === 'simple';
+
+      const respondAuthError = (status: number, message: string) => {
+        if (useSimple) {
+          return res.status(status).json({ error: 'AUTHENTICATION_ERROR', message });
+        }
+        return res.status(status).json({
           success: false,
           error: {
             type: 'authentication_error',
-            message: 'Missing or invalid authorization header. Expected: Authorization: Bearer <token>'
+            message
           }
         });
+      };
+      
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return respondAuthError(
+          401,
+          'Missing or invalid authorization header. Expected: Authorization: Bearer <token>'
+        );
       }
       
       const token = authHeader.substring(7); // Remove 'Bearer ' prefix
@@ -39,13 +54,7 @@ export function authenticateUser(supabase: SupabaseClient) {
       const { data: { user }, error } = await supabase.auth.getUser(token);
       
       if (error || !user) {
-        return res.status(401).json({
-          success: false,
-          error: {
-            type: 'authentication_error',
-            message: 'Invalid or expired token'
-          }
-        });
+        return respondAuthError(401, 'Invalid or expired token');
       }
       
       // Attach user to request
@@ -57,13 +66,15 @@ export function authenticateUser(supabase: SupabaseClient) {
       next();
     } catch (error) {
       console.error('Authentication error:', error);
-      return res.status(401).json({
-        success: false,
-        error: {
-          type: 'authentication_error',
-          message: 'Authentication failed'
-        }
-      });
+      return options?.responseFormat === 'simple'
+        ? res.status(401).json({ error: 'AUTHENTICATION_ERROR', message: 'Authentication failed' })
+        : res.status(401).json({
+            success: false,
+            error: {
+              type: 'authentication_error',
+              message: 'Authentication failed'
+            }
+          });
     }
   };
 }
