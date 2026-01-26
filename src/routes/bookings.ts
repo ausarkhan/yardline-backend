@@ -13,6 +13,18 @@ import * as db from '../db';
 import { authenticateUser } from '../middleware/auth';
 import { resolveBookingServiceDetails } from './bookingServiceResolver';
 
+const isValidUuid = (value: string): boolean =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+
+const parseIsoDate = (value: string): Date | null => {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
+};
+
+const toDateString = (date: Date): string => date.toISOString().slice(0, 10);
+const toTimeString = (date: Date): string => date.toISOString().slice(11, 19);
+
 export function createBookingRoutes(
   supabase: SupabaseClient,
   stripe: Stripe,
@@ -106,6 +118,230 @@ export function createBookingRoutes(
 
       const customerId = req.user!.id;
 
+
+  // POST /v1/bookings/pay-online - Create booking + Stripe Checkout Session (single call)
+  router.post('/bookings/pay-online', authenticateUser(supabase), async (req, res) => {
+    try {
+      const {
+        providerUserId,
+        serviceId,
+        serviceName,
+        servicePriceCents,
+        serviceDurationMinutes,
+        startTime,
+        endTime
+      } = req.body;
+
+      const customerUserId = req.user!.id;
+
+      console.log('[BOOKING_PAY_ONLINE_REQUEST]');
+
+      if (!providerUserId || typeof providerUserId !== 'string' || !isValidUuid(providerUserId)) {
+        return res.status(400).json({
+          success: false,
+          error: { type: 'invalid_request_error', message: 'providerUserId must be a valid UUID' }
+        });
+      }
+
+      if (!serviceId || typeof serviceId !== 'string' || serviceId.trim().length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: { type: 'invalid_request_error', message: 'serviceId must be a non-empty string' }
+        });
+      }
+
+      if (!serviceName || typeof serviceName !== 'string' || serviceName.trim().length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: { type: 'invalid_request_error', message: 'serviceName must be a non-empty string' }
+        });
+      }
+
+      if (!Number.isInteger(servicePriceCents) || servicePriceCents <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: { type: 'invalid_request_error', message: 'servicePriceCents must be a positive integer' }
+        });
+      }
+
+      if (!Number.isInteger(serviceDurationMinutes) || serviceDurationMinutes <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: { type: 'invalid_request_error', message: 'serviceDurationMinutes must be a positive integer' }
+        });
+      }
+
+      if (!startTime || typeof startTime !== 'string' || !endTime || typeof endTime !== 'string') {
+        return res.status(400).json({
+          success: false,
+          error: { type: 'invalid_request_error', message: 'startTime and endTime must be valid ISO strings' }
+        });
+      }
+
+      const startDate = parseIsoDate(startTime);
+      const endDate = parseIsoDate(endTime);
+
+      if (!startDate || !endDate) {
+        return res.status(400).json({
+          success: false,
+          error: { type: 'invalid_request_error', message: 'startTime and endTime must be valid ISO strings' }
+        });
+      }
+
+      if (endDate <= startDate) {
+        return res.status(400).json({
+          success: false,
+          error: { type: 'invalid_request_error', message: 'endTime must be after startTime' }
+        });
+      }
+
+      const startDateStr = toDateString(startDate);
+      const endDateStr = toDateString(endDate);
+
+      if (startDateStr !== endDateStr) {
+        return res.status(400).json({
+          success: false,
+          error: { type: 'invalid_request_error', message: 'startTime and endTime must be on the same day' }
+        });
+      }
+
+      const { data: providerUser, error: providerUserError } = await supabase.auth.admin.getUserById(
+        providerUserId
+      );
+
+      if (providerUserError || !providerUser?.user) {
+        return res.status(400).json({
+          success: false,
+          error: { type: 'invalid_request_error', message: 'providerUserId must reference an existing user' }
+        });
+      }
+
+      const timeStart = toTimeString(startDate);
+      const timeEnd = toTimeString(endDate);
+      const platformFeeCents = calculateBookingPlatformFee(servicePriceCents);
+      const totalChargeCents = servicePriceCents + platformFeeCents;
+
+      const insertPayload = {
+        customer_id: customerUserId,
+        provider_id: providerUserId,
+        service_id: isValidUuid(serviceId) ? serviceId : null,
+        service_name: serviceName.trim(),
+        date: startDateStr,
+        time_start: timeStart,
+        time_end: timeEnd,
+        status: 'pending',
+        payment_status: 'none',
+        payment_intent_id: null,
+        amount_total: totalChargeCents,
+        service_price_cents: servicePriceCents,
+        platform_fee_cents: platformFeeCents
+      };
+
+      const { data: booking, error: bookingError } = await supabase
+        .from('bookings')
+        .insert(insertPayload)
+        .select()
+        .single();
+
+      if (bookingError) {
+        if (bookingError.code === '23P01' || bookingError.message?.includes('no_double_booking')) {
+          return res.status(409).json({
+            success: false,
+            error: { type: 'booking_conflict', message: 'Time slot already booked' }
+          });
+        }
+        throw bookingError;
+      }
+
+      if (!booking?.id) {
+        throw new Error('Booking creation failed: missing booking id');
+      }
+
+      const bookingId = booking.id as string;
+
+      console.log('[BOOKING_PAY_ONLINE_CREATED]', bookingId);
+
+      const appUrlScheme = process.env.APP_URL_SCHEME || 'yardline';
+      const sessionParams: Stripe.Checkout.SessionCreateParams = {
+        mode: 'payment',
+        payment_method_types: ['card'],
+        line_items: [
+          {
+            price_data: {
+              currency: 'usd',
+              unit_amount: totalChargeCents,
+              product_data: {
+                name: serviceName.trim()
+              }
+            },
+            quantity: 1
+          }
+        ],
+        success_url: `${appUrlScheme}://payment-success?type=booking&session_id={CHECKOUT_SESSION_ID}&booking_id=${bookingId}`,
+        cancel_url: `${appUrlScheme}://payment-cancel?type=booking&booking_id=${bookingId}`,
+        metadata: {
+          type: 'booking',
+          bookingId,
+          providerUserId,
+          customerUserId
+        }
+      };
+
+      const providerStripeAccountId = await getOrCreateStripeAccountId(
+        providerUserId,
+        `provider-${providerUserId}@yardline.app`,
+        `Provider ${providerUserId}`
+      );
+
+      sessionParams.payment_intent_data = {
+        transfer_data: {
+          destination: providerStripeAccountId
+        },
+        metadata: {
+          type: 'booking',
+          bookingId,
+          providerUserId,
+          customerUserId
+        },
+        ...(platformFeeCents > 0 ? { application_fee_amount: platformFeeCents } : {})
+      };
+
+      const session = await stripe.checkout.sessions.create(sessionParams);
+
+      if (!session.url || !session.id) {
+        throw new Error('Stripe checkout session missing url or id');
+      }
+
+      const { error: updateError } = await supabase
+        .from('bookings')
+        .update({
+          stripe_checkout_session_id: session.id,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', bookingId);
+
+      if (updateError) {
+        console.error('Failed to store checkout session ID on booking:', updateError);
+      }
+
+      console.log('[BOOKING_PAY_ONLINE_CHECKOUT]', bookingId, session.id);
+
+      return res.json({
+        success: true,
+        data: {
+          bookingId,
+          sessionId: session.id,
+          url: session.url
+        }
+      });
+    } catch (error) {
+      console.error('Error creating booking pay-online session:', error);
+      return res.status(500).json({
+        success: false,
+        error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to create booking checkout session' }
+      });
+    }
+  });
       // Validate required fields
       if (!date || !timeStart) {
         return res.status(400).json({
