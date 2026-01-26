@@ -250,11 +250,13 @@ export function createBookingRoutes(
             error: { type: 'booking_conflict', message: 'Time slot already booked' }
           });
         }
-        throw bookingError;
+        console.error('[BOOKING_PAY_ONLINE_ERROR] Failed to create booking:', bookingError);
+        return res.status(500).json({ success: false, error: 'Booking pay online failed' });
       }
 
       if (!booking?.id) {
-        throw new Error('Booking creation failed: missing booking id');
+        console.error('[BOOKING_PAY_ONLINE_ERROR] Booking creation failed: missing booking id');
+        return res.status(500).json({ success: false, error: 'Booking pay online failed' });
       }
 
       const bookingId = booking.id as string;
@@ -309,7 +311,13 @@ export function createBookingRoutes(
       const session = await stripe.checkout.sessions.create(sessionParams);
 
       if (!session.url || !session.id) {
-        throw new Error('Stripe checkout session missing url or id');
+        console.error('[BOOKING_PAY_ONLINE_ERROR] Stripe checkout session missing url or id');
+        return res.status(500).json({ success: false, error: 'Booking pay online failed' });
+      }
+
+      if (!bookingId || !session.url) {
+        console.error('[BOOKING_PAY_ONLINE_ERROR] Missing bookingId or session url');
+        return res.status(500).json({ success: false, error: 'Booking pay online failed' });
       }
 
       const { error: updateError } = await supabase
@@ -326,7 +334,7 @@ export function createBookingRoutes(
 
       console.log('[BOOKING_PAY_ONLINE_CHECKOUT]', bookingId, session.id);
 
-      return res.json({
+      return res.status(200).json({
         success: true,
         data: {
           bookingId,
@@ -335,11 +343,8 @@ export function createBookingRoutes(
         }
       });
     } catch (error) {
-      console.error('Error creating booking pay-online session:', error);
-      return res.status(500).json({
-        success: false,
-        error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to create booking checkout session' }
-      });
+      console.error('[BOOKING_PAY_ONLINE_ERROR]', error);
+      return res.status(500).json({ success: false, error: 'Booking pay online failed' });
     }
   });
       // Validate required fields
