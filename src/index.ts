@@ -7,6 +7,11 @@ import * as db from './db';
 import { authenticateUser, optionalAuth } from './middleware/auth';
 import { createBookingRoutes } from './routes/bookings';
 import { createBookingV1Routes } from './routes/bookings-v1';
+import {
+  getOrCreateProviderStripeAccountId,
+  getStripeAccountStatus,
+  isStripeAccountReady
+} from './stripeConnect';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -243,52 +248,6 @@ const processedWebhookEvents: Set<string> = new Set(); // Track processed webhoo
 
 // Note: Bookings and Services are now stored in Supabase database, not in-memory
 
-// User records structure to track Stripe account IDs (LIVE only)
-interface UserStripeAccounts {
-  userId: string;
-  liveStripeAccountId?: string;
-}
-
-const userStripeAccounts: Map<string, UserStripeAccounts> = new Map();
-
-// Helper function to get or create Stripe Connect account (LIVE mode only)
-async function getOrCreateStripeAccountId(userId: string, email: string, name: string): Promise<string> {
-  // Get or initialize user's Stripe account
-  let userAccounts = userStripeAccounts.get(userId);
-  if (!userAccounts) {
-    userAccounts = { userId };
-    userStripeAccounts.set(userId, userAccounts);
-  }
-
-  // Check if we already have a LIVE account ID
-  if (userAccounts.liveStripeAccountId) {
-    return userAccounts.liveStripeAccountId;
-  }
-
-  // Create a new Stripe Express account in LIVE mode
-  console.log(`Creating Stripe Connect account for user ${userId} (LIVE mode)`);
-  try {
-    const account = await stripe.accounts.create({
-      type: 'express',
-      email,
-      capabilities: {
-        card_payments: { requested: true },
-        transfers: { requested: true },
-      },
-      business_profile: { name },
-    });
-
-    // Store the LIVE account ID
-    userAccounts.liveStripeAccountId = account.id;
-    userStripeAccounts.set(userId, userAccounts);
-    
-    console.log(`✅ Created Stripe Connect account: ${account.id} for user ${userId}`);
-    return account.id;
-  } catch (error) {
-    console.error(`❌ Failed to create Stripe Connect account for user ${userId}:`, error);
-    throw error;
-  }
-}
 
 // Handler function for checkout session completed webhook events
 async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) {
@@ -873,9 +832,22 @@ app.get('/v1/stripe/mode', (req, res) => {
 app.post('/v1/stripe/connect/accounts', async (req, res) => {
   try {
     const { email, name, returnUrl, refreshUrl, userId } = req.body;
+
+    if (!userId || typeof userId !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: { type: 'invalid_request_error', message: 'Missing required field: userId' }
+      });
+    }
     
     // Get or create the appropriate Stripe account for this mode and user
-    const accountId = await getOrCreateStripeAccountId(userId || 'default', email, name);
+    const accountId = await getOrCreateProviderStripeAccountId({
+      supabase,
+      stripe,
+      providerId: userId,
+      email,
+      name
+    });
     
     const accountLink = await stripe.accountLinks.create({
       account: accountId,
@@ -951,16 +923,16 @@ app.post('/v1/checkout/create-session', async (req, res) => {
       eventId, 
       eventName,
       items, // Array of { ticketTypeId, ticketTypeName, priceCents, quantity }
-      connectedAccountId
+      providerId
     } = req.body;
 
     // Validate required fields
-    if (!userId || !eventId || !items || !Array.isArray(items) || items.length === 0 || !connectedAccountId) {
+    if (!userId || !eventId || !items || !Array.isArray(items) || items.length === 0 || !providerId) {
       return res.status(400).json({ 
         success: false, 
         error: { 
           type: 'invalid_request_error', 
-          message: 'Missing required fields: userId, eventId, items, and connectedAccountId are required' 
+          message: 'Missing required fields: userId, eventId, items, and providerId are required' 
         } 
       });
     }
@@ -1062,6 +1034,20 @@ app.post('/v1/checkout/create-session', async (req, res) => {
     // Production uses 'yardline://', dev/preview uses 'vibecode://'
     const APP_URL_SCHEME = process.env.APP_URL_SCHEME || 'yardline';
 
+    const providerStripeAccountId = await getOrCreateProviderStripeAccountId({
+      supabase,
+      stripe,
+      providerId
+    });
+
+    const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
+    if (!isStripeAccountReady(accountStatus)) {
+      return res.status(400).json({
+        code: 'PROVIDER_PAYOUT_SETUP_REQUIRED',
+        message: 'Provider must complete payout setup to accept online payments.'
+      });
+    }
+
     // Create Checkout Session with Model A pricing structure
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
@@ -1071,7 +1057,7 @@ app.post('/v1/checkout/create-session', async (req, res) => {
       payment_intent_data: {
         application_fee_amount: 99, // YardLine nets exactly $0.99 per ticket (in cents)
         transfer_data: {
-          destination: connectedAccountId, // Host receives ticket price
+          destination: providerStripeAccountId, // Host receives ticket price
         },
         metadata: {
           user_id: userId,
@@ -1172,16 +1158,16 @@ app.post('/v1/checkout/session', async (req, res) => {
       eventId, 
       eventName,
       items, // Array of { ticketTypeId, ticketTypeName, priceCents, quantity }
-      connectedAccountId
+      providerId
     } = req.body;
 
     // Validate required fields
-    if (!userId || !eventId || !items || !Array.isArray(items) || items.length === 0 || !connectedAccountId) {
+    if (!userId || !eventId || !items || !Array.isArray(items) || items.length === 0 || !providerId) {
       return res.status(400).json({ 
         success: false, 
         error: { 
           type: 'invalid_request_error', 
-          message: 'Missing required fields: userId, eventId, items, and connectedAccountId are required' 
+          message: 'Missing required fields: userId, eventId, items, and providerId are required' 
         } 
       });
     }
@@ -1283,6 +1269,20 @@ app.post('/v1/checkout/session', async (req, res) => {
     // Production uses 'yardline://', dev/preview uses 'vibecode://'
     const APP_URL_SCHEME = process.env.APP_URL_SCHEME || 'yardline';
 
+    const providerStripeAccountId = await getOrCreateProviderStripeAccountId({
+      supabase,
+      stripe,
+      providerId
+    });
+
+    const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
+    if (!isStripeAccountReady(accountStatus)) {
+      return res.status(400).json({
+        code: 'PROVIDER_PAYOUT_SETUP_REQUIRED',
+        message: 'Provider must complete payout setup to accept online payments.'
+      });
+    }
+
     // Create Checkout Session with Model A pricing structure
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
@@ -1292,7 +1292,7 @@ app.post('/v1/checkout/session', async (req, res) => {
       payment_intent_data: {
         application_fee_amount: 99, // YardLine nets exactly $0.99 per ticket (in cents)
         transfer_data: {
-          destination: connectedAccountId, // Host receives ticket price
+          destination: providerStripeAccountId, // Host receives ticket price
         },
         metadata: {
           user_id: userId,
@@ -1348,19 +1348,19 @@ app.post('/v1/payments/create-intent', async (req, res) => {
       userId, 
       eventId, 
       items, // Array of { ticketTypeId, ticketTypeName, priceCents, quantity }
-      connectedAccountId,
+      providerId,
       description,
       customerEmail,
       customerName
     } = req.body;
 
     // Validate required fields
-    if (!userId || !eventId || !items || !Array.isArray(items) || items.length === 0) {
+    if (!userId || !eventId || !items || !Array.isArray(items) || items.length === 0 || !providerId) {
       return res.status(400).json({ 
         success: false, 
         error: { 
           type: 'invalid_request_error', 
-          message: 'Missing required fields: userId, eventId, and items are required' 
+          message: 'Missing required fields: userId, eventId, items, and providerId are required' 
         } 
       });
     }
@@ -1489,17 +1489,27 @@ app.post('/v1/payments/create-intent', async (req, res) => {
       paymentIntentParams.customer = customerId;
     }
 
-    // Configure Connect transfer if selling on behalf of connected account
-    // MODEL A: application_fee_amount = ticketSubtotal (host receives 100% of ticket price)
-    // Buyer fee covers Stripe fees + YardLine revenue
-    if (connectedAccountId) {
-      paymentIntentParams.transfer_data = { 
-        destination: connectedAccountId 
-      };
-      // Host receives the full ticket price (this is transferred to their account)
-      paymentIntentParams.application_fee_amount = ticketSubtotalCents;
-      paymentIntentParams.metadata!.connected_account = connectedAccountId;
+    const providerStripeAccountId = await getOrCreateProviderStripeAccountId({
+      supabase,
+      stripe,
+      providerId
+    });
+
+    const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
+    if (!isStripeAccountReady(accountStatus)) {
+      return res.status(400).json({
+        code: 'PROVIDER_PAYOUT_SETUP_REQUIRED',
+        message: 'Provider must complete payout setup to accept online payments.'
+      });
     }
+
+    // Configure Connect transfer (Model A)
+    paymentIntentParams.transfer_data = {
+      destination: providerStripeAccountId
+    };
+    // Host receives the full ticket price (this is transferred to their account)
+    paymentIntentParams.application_fee_amount = ticketSubtotalCents;
+    paymentIntentParams.metadata!.connected_account = providerStripeAccountId;
 
     // Create payment intent with auto-generated idempotency key
     const idempotencyKey = `payment_${userId}_${eventId}_${Date.now()}`;
@@ -1553,7 +1563,7 @@ app.post('/v1/stripe/payment-intents', async (req, res) => {
       description, 
       metadata,
       // Legacy format fields
-      connectedAccountId, 
+      providerId,
       items, 
       ticketSubtotalCents, 
       platformFeeTotalCents, 
@@ -1627,11 +1637,33 @@ app.post('/v1/stripe/payment-intents', async (req, res) => {
         automatic_payment_methods: { enabled: true },
       };
       
-      if (connectedAccountId) {
-        paymentIntentParams.transfer_data = { destination: connectedAccountId };
-        paymentIntentParams.application_fee_amount = ticketSubtotalCents;
-        paymentIntentParams.metadata!.connected_account = connectedAccountId;
+      if (!providerId) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            type: 'invalid_request_error',
+            message: 'Missing required field: providerId'
+          }
+        });
       }
+
+      const providerStripeAccountId = await getOrCreateProviderStripeAccountId({
+        supabase,
+        stripe,
+        providerId
+      });
+
+      const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
+      if (!isStripeAccountReady(accountStatus)) {
+        return res.status(400).json({
+          code: 'PROVIDER_PAYOUT_SETUP_REQUIRED',
+          message: 'Provider must complete payout setup to accept online payments.'
+        });
+      }
+
+      paymentIntentParams.transfer_data = { destination: providerStripeAccountId };
+      paymentIntentParams.application_fee_amount = ticketSubtotalCents;
+      paymentIntentParams.metadata!.connected_account = providerStripeAccountId;
       
       const paymentIntent = await stripe.paymentIntents.create(
         paymentIntentParams, 
@@ -1801,7 +1833,6 @@ const bookingRouter = createBookingRoutes(
   supabase,
   stripe,
   calculateBookingPlatformFee,
-  getOrCreateStripeAccountId,
   REVIEW_MODE,
   REVIEW_MODE_MAX_CHARGE_CENTS
 );

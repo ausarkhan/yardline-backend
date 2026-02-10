@@ -12,6 +12,11 @@ import { v4 as uuidv4 } from 'uuid';
 import * as db from '../db';
 import { authenticateUser } from '../middleware/auth';
 import { resolveBookingServiceDetails } from './bookingServiceResolver';
+import {
+  getOrCreateProviderStripeAccountId,
+  getStripeAccountStatus,
+  isStripeAccountReady
+} from '../stripeConnect';
 
 const isValidUuid = (value: string): boolean =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
@@ -41,11 +46,10 @@ const isPaidPaymentStatus = (status: unknown): boolean => {
 export function createCheckoutSessionHandler(params: {
   supabase: SupabaseClient;
   stripe: Stripe;
-  getOrCreateStripeAccountId: (userId: string, email: string, name: string) => Promise<string>;
   dbClient?: CheckoutSessionDbClient;
   now?: () => Date;
 }) {
-  const { supabase, stripe, getOrCreateStripeAccountId } = params;
+  const { supabase, stripe } = params;
   const dbClient = params.dbClient ?? db;
   const now = params.now ?? (() => new Date());
 
@@ -317,18 +321,23 @@ export function createCheckoutSessionHandler(params: {
         }
       };
 
-      // Use the same Stripe Connect pattern as ticket checkout (destination charges)
-      let providerStripeAccountId: string | null =
-        (booking as any).provider_stripe_account_id ||
-        (booking as any).providerStripeAccountId ||
-        null;
+      // Use provider's single Stripe Connect account (destination charges)
+      let providerStripeAccountId: string | null = null;
 
-      if (!providerStripeAccountId && booking.provider_id) {
-        providerStripeAccountId = await getOrCreateStripeAccountId(
-          booking.provider_id,
-          `provider-${booking.provider_id}@yardline.app`,
-          `Provider ${booking.provider_id}`
-        );
+      if (booking.provider_id) {
+        providerStripeAccountId = await getOrCreateProviderStripeAccountId({
+          supabase,
+          stripe,
+          providerId: booking.provider_id
+        });
+
+        const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
+        if (!isStripeAccountReady(accountStatus)) {
+          return res.status(400).json({
+            code: 'PROVIDER_PAYOUT_SETUP_REQUIRED',
+            message: 'Provider must complete payout setup to accept online payments.'
+          });
+        }
       }
 
       let applicationFeeAmount: number | null = null;
@@ -499,7 +508,6 @@ export function createBookingRoutes(
   supabase: SupabaseClient,
   stripe: Stripe,
   calculateBookingPlatformFee: (priceCents: number) => number,
-  getOrCreateStripeAccountId: (userId: string, email: string, name: string) => Promise<string>,
   REVIEW_MODE: boolean,
   REVIEW_MODE_MAX_CHARGE_CENTS: number
 ) {
@@ -766,11 +774,19 @@ export function createBookingRoutes(
         }
       };
 
-      const providerStripeAccountId = await getOrCreateStripeAccountId(
-        providerUserId,
-        `provider-${providerUserId}@yardline.app`,
-        `Provider ${providerUserId}`
-      );
+      const providerStripeAccountId = await getOrCreateProviderStripeAccountId({
+        supabase,
+        stripe,
+        providerId: providerUserId
+      });
+
+      const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
+      if (!isStripeAccountReady(accountStatus)) {
+        return res.status(400).json({
+          code: 'PROVIDER_PAYOUT_SETUP_REQUIRED',
+          message: 'Provider must complete payout setup to accept online payments.'
+        });
+      }
 
       sessionParams.payment_intent_data = {
         transfer_data: {
@@ -1264,8 +1280,7 @@ export function createBookingRoutes(
     authenticateUser(supabase, { responseFormat: 'simple' }),
     createCheckoutSessionHandler({
       supabase,
-      stripe,
-      getOrCreateStripeAccountId
+      stripe
     })
   );
 

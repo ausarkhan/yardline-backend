@@ -41,6 +41,13 @@ export interface DBBooking {
   updated_at: string;
 }
 
+export interface DBProvider {
+  provider_id: string;
+  stripe_account_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 // ============================================================================
 // Service Operations
 // ============================================================================
@@ -192,6 +199,51 @@ export async function getBooking(
     if (error.code === 'PGRST116') return null; // Not found
     throw error;
   }
+  return data;
+}
+
+// ============================================================================
+// Provider Stripe Account Operations
+// ============================================================================
+
+export async function getProviderStripeAccountId(
+  supabase: SupabaseClient,
+  providerId: string
+): Promise<string | null> {
+  const { data, error } = await supabase
+    .from('providers')
+    .select('stripe_account_id')
+    .eq('provider_id', providerId)
+    .single<{ stripe_account_id: string | null }>();
+
+  if (error) {
+    if (error.code === 'PGRST116') return null; // Not found
+    throw error;
+  }
+
+  return data?.stripe_account_id ?? null;
+}
+
+export async function setProviderStripeAccountId(
+  supabase: SupabaseClient,
+  providerId: string,
+  stripeAccountId: string
+): Promise<DBProvider> {
+  const { data, error } = await supabase
+    .from('providers')
+    .upsert(
+      {
+        provider_id: providerId,
+        stripe_account_id: stripeAccountId
+      },
+      {
+        onConflict: 'provider_id'
+      }
+    )
+    .select()
+    .single<DBProvider>();
+
+  if (error) throw error;
   return data;
 }
 
