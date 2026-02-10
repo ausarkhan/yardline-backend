@@ -914,6 +914,46 @@ app.post('/v1/stripe/connect/accounts/:accountId/link', async (req, res) => {
   }
 });
 
+// POST /v1/providers/payment-setup - Create onboarding link for provider payout setup
+app.post('/v1/providers/payment-setup', authenticateUser(supabase), async (req, res) => {
+  try {
+    const providerId = req.user?.id;
+    if (!providerId) {
+      return res.status(401).json({
+        error: 'UNAUTHORIZED',
+        message: 'Authentication required'
+      });
+    }
+
+    const stripeAccountId = await db.getProviderStripeAccountId(supabase, providerId);
+    if (!stripeAccountId) {
+      return res.status(400).json({
+        code: 'PROVIDER_STRIPE_ACCOUNT_MISSING',
+        message: 'Provider payout account is missing. Please contact support.'
+      });
+    }
+
+    const appBaseUrl = process.env.APP_BASE_URL || 'https://yardline.app';
+
+    const accountLink = await stripe.accountLinks.create({
+      account: stripeAccountId,
+      refresh_url: `${appBaseUrl}/payment-setup`,
+      return_url: `${appBaseUrl}/payment-setup/complete`,
+      type: 'account_onboarding'
+    });
+
+    return res.json({ url: accountLink.url });
+  } catch (error) {
+    console.error('[PROVIDER_PAYMENT_SETUP_ERROR]', {
+      message: error instanceof Error ? error.message : 'Failed to create account link'
+    });
+    return res.status(500).json({
+      error: 'PROVIDER_PAYMENT_SETUP_FAILED',
+      message: 'Failed to create payout setup link'
+    });
+  }
+});
+
 // POST /v1/checkout/create-session - Create Stripe Checkout Session with Model A pricing
 // This endpoint uses Checkout Sessions for a hosted payment experience
 app.post('/v1/checkout/create-session', async (req, res) => {
