@@ -5,19 +5,169 @@ import * as db from './db';
 type StripeAccountStatus = {
   chargesEnabled: boolean;
   payoutsEnabled: boolean;
+  detailsSubmitted: boolean;
   transfersEnabled: boolean | null;
   disabledReason: string | null;
 };
 
-const formatProviderName = (rawName?: string | null, providerId?: string): string => {
-  if (rawName && rawName.trim().length > 0) return rawName.trim();
-  return providerId ? `Provider ${providerId}` : 'Provider';
-};
+async function findExistingConnectedAccountIdInStripe(params: {
+  stripe: Stripe;
+  userId: string;
+  userEmail?: string | null;
+}): Promise<string | null> {
+  const { stripe, userId, userEmail } = params;
 
-const formatProviderEmail = (rawEmail?: string | null, providerId?: string): string => {
-  if (rawEmail && rawEmail.trim().length > 0) return rawEmail.trim();
-  return providerId ? `provider-${providerId}@yardline.app` : 'provider@yardline.app';
-};
+  let startingAfter: string | undefined;
+
+  while (true) {
+    const accounts = await stripe.accounts.list({
+      limit: 100,
+      ...(startingAfter ? { starting_after: startingAfter } : {})
+    });
+
+    const metadataMatch = accounts.data.find(
+      account => account.metadata?.user_id === userId
+    );
+
+    if (metadataMatch) {
+      return metadataMatch.id;
+    }
+
+    if (userEmail && userEmail.trim().length > 0) {
+      const normalizedEmail = userEmail.trim().toLowerCase();
+      const emailMatch = accounts.data.find(
+        account => (account.email || '').trim().toLowerCase() === normalizedEmail
+      );
+
+      if (emailMatch) {
+        return emailMatch.id;
+      }
+    }
+
+    if (!accounts.has_more || accounts.data.length === 0) {
+      break;
+    }
+
+    startingAfter = accounts.data[accounts.data.length - 1].id;
+  }
+
+  return null;
+}
+
+export async function getOrCreateConnectedAccount(params: {
+  supabase: SupabaseClient;
+  stripe: Stripe;
+  userId: string;
+  userEmail?: string | null;
+  displayName?: string | null;
+}): Promise<string> {
+  const { supabase, stripe, userId } = params;
+
+  const existingDbAccount = await db.getStripeConnectedAccountByUserId(supabase, userId);
+  if (existingDbAccount?.stripe_account_id) {
+    console.log(
+      `[STRIPE_CONNECT] userId=${userId} stripeAccountId=${existingDbAccount.stripe_account_id} reused_from_db`
+    );
+    return existingDbAccount.stripe_account_id;
+  }
+
+  let userEmail = params.userEmail ?? null;
+  let displayName = params.displayName ?? null;
+
+  try {
+    const { data, error } = await supabase.auth.admin.getUserById(userId);
+    if (!error && data?.user) {
+      userEmail = userEmail ?? data.user.email ?? null;
+      const metadataName =
+        typeof data.user.user_metadata?.full_name === 'string'
+          ? data.user.user_metadata.full_name
+          : null;
+      displayName = displayName ?? metadataName;
+    }
+  } catch (error) {
+    console.warn('[STRIPE_CONNECT] Failed to load user profile for account mapping', {
+      userId,
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+
+  const stripeExistingId = await findExistingConnectedAccountIdInStripe({
+    stripe,
+    userId,
+    userEmail
+  });
+
+  if (stripeExistingId) {
+    const stripeAccount = await stripe.accounts.retrieve(stripeExistingId);
+
+    const existingByStripeId = await db.getStripeConnectedAccountByStripeAccountId(
+      supabase,
+      stripeExistingId
+    );
+    if (existingByStripeId && existingByStripeId.user_id !== userId) {
+      throw new Error(
+        `Stripe account ${stripeExistingId} is already mapped to a different user`
+      );
+    }
+
+    await db.upsertStripeConnectedAccount(supabase, {
+      userId,
+      stripeAccountId: stripeExistingId,
+      chargesEnabled: !!stripeAccount.charges_enabled,
+      payoutsEnabled: !!stripeAccount.payouts_enabled,
+      detailsSubmitted: !!stripeAccount.details_submitted
+    });
+
+    console.log(
+      `[STRIPE_CONNECT] userId=${userId} stripeAccountId=${stripeExistingId} reused_from_stripe`
+    );
+
+    return stripeExistingId;
+  }
+
+  const account = await stripe.accounts.create({
+    type: 'express',
+    ...(userEmail && userEmail.trim().length > 0 ? { email: userEmail.trim() } : {}),
+    capabilities: {
+      card_payments: { requested: true },
+      transfers: { requested: true }
+    },
+    ...(displayName && displayName.trim().length > 0
+      ? { business_profile: { name: displayName.trim() } }
+      : {}),
+    metadata: {
+      user_id: userId
+    }
+  }, {
+    idempotencyKey: `create_connect_${userId}`
+  });
+
+  const existingByStripeId = await db.getStripeConnectedAccountByStripeAccountId(
+    supabase,
+    account.id
+  );
+  if (existingByStripeId && existingByStripeId.user_id !== userId) {
+    throw new Error(
+      `Stripe account ${account.id} is already mapped to a different user`
+    );
+  }
+
+  await db.upsertStripeConnectedAccount(supabase, {
+    userId,
+    stripeAccountId: account.id,
+    chargesEnabled: !!account.charges_enabled,
+    payoutsEnabled: !!account.payouts_enabled,
+    detailsSubmitted: !!account.details_submitted
+  });
+
+  await db.setProviderStripeAccountId(supabase, userId, account.id);
+
+  console.log(
+    `[STRIPE_CONNECT] userId=${userId} stripeAccountId=${account.id} created`
+  );
+
+  return account.id;
+}
 
 export async function getOrCreateProviderStripeAccountId(params: {
   supabase: SupabaseClient;
@@ -26,53 +176,13 @@ export async function getOrCreateProviderStripeAccountId(params: {
   email?: string | null;
   name?: string | null;
 }): Promise<string> {
-  const { supabase, stripe, providerId } = params;
-
-  const existingAccountId = await db.getProviderStripeAccountId(supabase, providerId);
-  if (existingAccountId) {
-    console.log(
-      `[STRIPE_CONNECT] providerId=${providerId} stripeAccountId=${existingAccountId} reused`
-    );
-    return existingAccountId;
-  }
-
-  let providerEmail = params.email ?? null;
-  let providerName = params.name ?? null;
-
-  try {
-    const { data, error } = await supabase.auth.admin.getUserById(providerId);
-    if (!error && data?.user) {
-      providerEmail = providerEmail ?? data.user.email ?? null;
-      const metadataName =
-        typeof data.user.user_metadata?.full_name === 'string'
-          ? data.user.user_metadata.full_name
-          : null;
-      providerName = providerName ?? metadataName;
-    }
-  } catch (error) {
-    console.warn('[STRIPE_CONNECT] Failed to load provider profile for account creation', {
-      providerId,
-      message: error instanceof Error ? error.message : 'Unknown error'
-    });
-  }
-
-  const account = await stripe.accounts.create({
-    type: 'express',
-    email: formatProviderEmail(providerEmail, providerId),
-    capabilities: {
-      card_payments: { requested: true },
-      transfers: { requested: true }
-    },
-    business_profile: { name: formatProviderName(providerName, providerId) }
+  return getOrCreateConnectedAccount({
+    supabase: params.supabase,
+    stripe: params.stripe,
+    userId: params.providerId,
+    userEmail: params.email,
+    displayName: params.name
   });
-
-  await db.setProviderStripeAccountId(supabase, providerId, account.id);
-
-  console.log(
-    `[STRIPE_CONNECT] providerId=${providerId} stripeAccountId=${account.id} created`
-  );
-
-  return account.id;
 }
 
 export async function getStripeAccountStatus(
@@ -83,6 +193,7 @@ export async function getStripeAccountStatus(
 
   const chargesEnabled = !!account.charges_enabled;
   const payoutsEnabled = !!account.payouts_enabled;
+  const detailsSubmitted = !!account.details_submitted;
   const transfersCapability = account.capabilities?.transfers ?? null;
   const transfersEnabled = transfersCapability ? transfersCapability === 'active' : null;
   const disabledReason = account.requirements?.disabled_reason ?? null;
@@ -94,6 +205,7 @@ export async function getStripeAccountStatus(
   return {
     chargesEnabled,
     payoutsEnabled,
+    detailsSubmitted,
     transfersEnabled,
     disabledReason
   };

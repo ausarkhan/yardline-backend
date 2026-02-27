@@ -13,7 +13,7 @@ import * as db from '../db';
 import { authenticateUser } from '../middleware/auth';
 import { resolveBookingServiceDetails } from './bookingServiceResolver';
 import {
-  getOrCreateProviderStripeAccountId,
+  getOrCreateConnectedAccount,
   getStripeAccountStatus,
   isStripeAccountReady
 } from '../stripeConnect';
@@ -325,10 +325,10 @@ export function createCheckoutSessionHandler(params: {
       let providerStripeAccountId: string | null = null;
 
       if (booking.provider_id) {
-        providerStripeAccountId = await getOrCreateProviderStripeAccountId({
+        providerStripeAccountId = await getOrCreateConnectedAccount({
           supabase,
           stripe,
-          providerId: booking.provider_id
+          userId: booking.provider_id
         });
 
         const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
@@ -774,10 +774,10 @@ export function createBookingRoutes(
         }
       };
 
-      const providerStripeAccountId = await getOrCreateProviderStripeAccountId({
+      const providerStripeAccountId = await getOrCreateConnectedAccount({
         supabase,
         stripe,
-        providerId: providerUserId
+        userId: providerUserId
       });
 
       const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);

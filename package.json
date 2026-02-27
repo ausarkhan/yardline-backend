@@ -10,6 +10,7 @@
     "validate-model-a": "./validate-model-a.sh",
     "validate-checkout": "./validate-checkout.sh",
     "test:booking-pay-online": "tsx scripts/booking-pay-online-dev.ts",
+    "fix:stripe-connect-duplicates": "tsx scripts/fix-stripe-connect-duplicates.ts",
     "test:unit": "node --test --loader tsx tests"
   },
   "dependencies": {

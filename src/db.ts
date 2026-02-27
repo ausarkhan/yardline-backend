@@ -48,6 +48,16 @@ export interface DBProvider {
   updated_at: string;
 }
 
+export interface DBStripeConnectedAccount {
+  user_id: string;
+  stripe_account_id: string;
+  charges_enabled: boolean | null;
+  payouts_enabled: boolean | null;
+  details_submitted: boolean | null;
+  created_at: string;
+  updated_at: string;
+}
+
 // ============================================================================
 // Service Operations
 // ============================================================================
@@ -206,22 +216,111 @@ export async function getBooking(
 // Provider Stripe Account Operations
 // ============================================================================
 
+export async function getStripeConnectedAccountByUserId(
+  supabase: SupabaseClient,
+  userId: string
+): Promise<DBStripeConnectedAccount | null> {
+  const { data, error } = await supabase
+    .from('stripe_connected_accounts')
+    .select('*')
+    .eq('user_id', userId)
+    .single<DBStripeConnectedAccount>();
+
+  if (error) {
+    if (error.code === 'PGRST116') return null;
+    throw error;
+  }
+
+  return data;
+}
+
+export async function getStripeConnectedAccountByStripeAccountId(
+  supabase: SupabaseClient,
+  stripeAccountId: string
+): Promise<DBStripeConnectedAccount | null> {
+  const { data, error } = await supabase
+    .from('stripe_connected_accounts')
+    .select('*')
+    .eq('stripe_account_id', stripeAccountId)
+    .single<DBStripeConnectedAccount>();
+
+  if (error) {
+    if (error.code === 'PGRST116') return null;
+    throw error;
+  }
+
+  return data;
+}
+
+export async function upsertStripeConnectedAccount(
+  supabase: SupabaseClient,
+  payload: {
+    userId: string;
+    stripeAccountId: string;
+    chargesEnabled?: boolean;
+    payoutsEnabled?: boolean;
+    detailsSubmitted?: boolean;
+  }
+): Promise<DBStripeConnectedAccount> {
+  const { userId, stripeAccountId, chargesEnabled, payoutsEnabled, detailsSubmitted } = payload;
+
+  const { data, error } = await supabase
+    .from('stripe_connected_accounts')
+    .upsert(
+      {
+        user_id: userId,
+        stripe_account_id: stripeAccountId,
+        ...(typeof chargesEnabled === 'boolean' ? { charges_enabled: chargesEnabled } : {}),
+        ...(typeof payoutsEnabled === 'boolean' ? { payouts_enabled: payoutsEnabled } : {}),
+        ...(typeof detailsSubmitted === 'boolean' ? { details_submitted: detailsSubmitted } : {}),
+        updated_at: new Date().toISOString()
+      },
+      {
+        onConflict: 'user_id'
+      }
+    )
+    .select()
+    .single<DBStripeConnectedAccount>();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function updateStripeConnectedAccountStatus(
+  supabase: SupabaseClient,
+  stripeAccountId: string,
+  status: {
+    chargesEnabled: boolean;
+    payoutsEnabled: boolean;
+    detailsSubmitted: boolean;
+  }
+): Promise<DBStripeConnectedAccount | null> {
+  const { data, error } = await supabase
+    .from('stripe_connected_accounts')
+    .update({
+      charges_enabled: status.chargesEnabled,
+      payouts_enabled: status.payoutsEnabled,
+      details_submitted: status.detailsSubmitted,
+      updated_at: new Date().toISOString()
+    })
+    .eq('stripe_account_id', stripeAccountId)
+    .select()
+    .single<DBStripeConnectedAccount>();
+
+  if (error) {
+    if (error.code === 'PGRST116') return null;
+    throw error;
+  }
+
+  return data;
+}
+
 export async function getProviderStripeAccountId(
   supabase: SupabaseClient,
   providerId: string
 ): Promise<string | null> {
-  const { data, error } = await supabase
-    .from('providers')
-    .select('stripe_account_id')
-    .eq('provider_id', providerId)
-    .single<{ stripe_account_id: string | null }>();
-
-  if (error) {
-    if (error.code === 'PGRST116') return null; // Not found
-    throw error;
-  }
-
-  return data?.stripe_account_id ?? null;
+  const connectedAccount = await getStripeConnectedAccountByUserId(supabase, providerId);
+  return connectedAccount?.stripe_account_id ?? null;
 }
 
 export async function setProviderStripeAccountId(
@@ -229,12 +328,18 @@ export async function setProviderStripeAccountId(
   providerId: string,
   stripeAccountId: string
 ): Promise<DBProvider> {
+  await upsertStripeConnectedAccount(supabase, {
+    userId: providerId,
+    stripeAccountId
+  });
+
   const { data, error } = await supabase
     .from('providers')
     .upsert(
       {
         provider_id: providerId,
-        stripe_account_id: stripeAccountId
+        stripe_account_id: stripeAccountId,
+        updated_at: new Date().toISOString()
       },
       {
         onConflict: 'provider_id'

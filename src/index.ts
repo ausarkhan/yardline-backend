@@ -8,7 +8,7 @@ import { authenticateUser, optionalAuth } from './middleware/auth';
 import { createBookingRoutes } from './routes/bookings';
 import { createBookingV1Routes } from './routes/bookings-v1';
 import {
-  getOrCreateProviderStripeAccountId,
+  getOrCreateConnectedAccount,
   getStripeAccountStatus,
   isStripeAccountReady
 } from './stripeConnect';
@@ -721,6 +721,11 @@ app.post(
         case 'account.updated':
           const account = event.data.object as Stripe.Account;
           console.log(`🔄 Account updated: ${account.id}`);
+          await db.updateStripeConnectedAccountStatus(supabase, account.id, {
+            chargesEnabled: !!account.charges_enabled,
+            payoutsEnabled: !!account.payouts_enabled,
+            detailsSubmitted: !!account.details_submitted
+          });
           const existing = connectAccounts.get(account.id);
           if (existing) {
             existing.chargesEnabled = account.charges_enabled || false;
@@ -841,12 +846,12 @@ app.post('/v1/stripe/connect/accounts', async (req, res) => {
     }
     
     // Get or create the appropriate Stripe account for this mode and user
-    const accountId = await getOrCreateProviderStripeAccountId({
+    const accountId = await getOrCreateConnectedAccount({
       supabase,
       stripe,
-      providerId: userId,
-      email,
-      name
+      userId,
+      userEmail: email,
+      displayName: name
     });
     
     const accountLink = await stripe.accountLinks.create({
@@ -875,19 +880,80 @@ app.post('/v1/stripe/connect/accounts', async (req, res) => {
   }
 });
 
+app.post('/v1/stripe/connect/onboarding-link', authenticateUser(supabase), async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    const { email, name, returnUrl, refreshUrl } = req.body || {};
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        error: { type: 'authentication_error', message: 'Authentication required' }
+      });
+    }
+
+    const accountId = await getOrCreateConnectedAccount({
+      supabase,
+      stripe,
+      userId,
+      userEmail: typeof email === 'string' ? email : undefined,
+      displayName: typeof name === 'string' ? name : undefined
+    });
+
+    const appBaseUrl = process.env.APP_BASE_URL || 'https://yardline.app';
+    const accountLink = await stripe.accountLinks.create({
+      account: accountId,
+      refresh_url: refreshUrl || `${appBaseUrl}/stripe/connect/refresh`,
+      return_url: returnUrl || `${appBaseUrl}/stripe/connect/return`,
+      type: 'account_onboarding'
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        accountId,
+        onboardingUrl: accountLink.url
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: {
+        type: 'api_error',
+        message: error instanceof Error ? error.message : 'Failed to create onboarding link'
+      }
+    });
+  }
+});
+
 app.get('/v1/stripe/connect/accounts/:accountId', async (req, res) => {
   try {
     const { accountId } = req.params;
-    const account = await stripe.accounts.retrieve(accountId);
+    const mappedAccount = await db.getStripeConnectedAccountByStripeAccountId(supabase, accountId);
+
+    if (!mappedAccount) {
+      return res.status(404).json({
+        success: false,
+        error: { type: 'resource_missing', message: 'Connected account not found' }
+      });
+    }
+
+    const computedStatus =
+      mappedAccount.charges_enabled && mappedAccount.payouts_enabled
+        ? 'active'
+        : mappedAccount.details_submitted
+          ? 'restricted'
+          : 'pending';
+
     const accountData: ConnectAccount = {
-      accountId: account.id,
-      email: account.email || '',
-      name: account.business_profile?.name || '',
-      chargesEnabled: account.charges_enabled || false,
-      payoutsEnabled: account.payouts_enabled || false,
-      detailsSubmitted: account.details_submitted || false,
-      status: account.charges_enabled && account.payouts_enabled ? 'active' : account.requirements?.disabled_reason ? 'restricted' : 'pending',
-      createdAt: account.created ? new Date(account.created * 1000).toISOString() : new Date().toISOString(),
+      accountId: mappedAccount.stripe_account_id,
+      email: '',
+      name: '',
+      chargesEnabled: !!mappedAccount.charges_enabled,
+      payoutsEnabled: !!mappedAccount.payouts_enabled,
+      detailsSubmitted: !!mappedAccount.details_submitted,
+      status: computedStatus,
+      createdAt: mappedAccount.created_at,
       liveStripeAccountId: accountId
     };
     
@@ -895,6 +961,52 @@ app.get('/v1/stripe/connect/accounts/:accountId', async (req, res) => {
     res.json({ success: true, data: accountData });
   } catch (error) {
     res.status(500).json({ success: false, error: { type: 'api_error', message: error instanceof Error ? error.message : 'Failed to get account' } });
+  }
+});
+
+app.post('/stripe/connect/onboarding-link', authenticateUser(supabase), async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    const { email, name, returnUrl, refreshUrl } = req.body || {};
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        error: { type: 'authentication_error', message: 'Authentication required' }
+      });
+    }
+
+    const accountId = await getOrCreateConnectedAccount({
+      supabase,
+      stripe,
+      userId,
+      userEmail: typeof email === 'string' ? email : undefined,
+      displayName: typeof name === 'string' ? name : undefined
+    });
+
+    const appBaseUrl = process.env.APP_BASE_URL || 'https://yardline.app';
+    const accountLink = await stripe.accountLinks.create({
+      account: accountId,
+      refresh_url: refreshUrl || `${appBaseUrl}/stripe/connect/refresh`,
+      return_url: returnUrl || `${appBaseUrl}/stripe/connect/return`,
+      type: 'account_onboarding'
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        accountId,
+        onboardingUrl: accountLink.url
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: {
+        type: 'api_error',
+        message: error instanceof Error ? error.message : 'Failed to create onboarding link'
+      }
+    });
   }
 });
 
@@ -925,13 +1037,11 @@ app.post('/v1/providers/payment-setup', authenticateUser(supabase), async (req, 
       });
     }
 
-    const stripeAccountId = await db.getProviderStripeAccountId(supabase, providerId);
-    if (!stripeAccountId) {
-      return res.status(400).json({
-        code: 'PROVIDER_STRIPE_ACCOUNT_MISSING',
-        message: 'Provider payout account is missing. Please contact support.'
-      });
-    }
+    const stripeAccountId = await getOrCreateConnectedAccount({
+      supabase,
+      stripe,
+      userId: providerId
+    });
 
     const appBaseUrl = process.env.APP_BASE_URL || 'https://yardline.app';
 
@@ -1074,10 +1184,10 @@ app.post('/v1/checkout/create-session', async (req, res) => {
     // Production uses 'yardline://', dev/preview uses 'vibecode://'
     const APP_URL_SCHEME = process.env.APP_URL_SCHEME || 'yardline';
 
-    const providerStripeAccountId = await getOrCreateProviderStripeAccountId({
+    const providerStripeAccountId = await getOrCreateConnectedAccount({
       supabase,
       stripe,
-      providerId
+      userId: providerId
     });
 
     const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
@@ -1309,10 +1419,10 @@ app.post('/v1/checkout/session', async (req, res) => {
     // Production uses 'yardline://', dev/preview uses 'vibecode://'
     const APP_URL_SCHEME = process.env.APP_URL_SCHEME || 'yardline';
 
-    const providerStripeAccountId = await getOrCreateProviderStripeAccountId({
+    const providerStripeAccountId = await getOrCreateConnectedAccount({
       supabase,
       stripe,
-      providerId
+      userId: providerId
     });
 
     const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
@@ -1529,10 +1639,10 @@ app.post('/v1/payments/create-intent', async (req, res) => {
       paymentIntentParams.customer = customerId;
     }
 
-    const providerStripeAccountId = await getOrCreateProviderStripeAccountId({
+    const providerStripeAccountId = await getOrCreateConnectedAccount({
       supabase,
       stripe,
-      providerId
+      userId: providerId
     });
 
     const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
@@ -1687,10 +1797,10 @@ app.post('/v1/stripe/payment-intents', async (req, res) => {
         });
       }
 
-      const providerStripeAccountId = await getOrCreateProviderStripeAccountId({
+      const providerStripeAccountId = await getOrCreateConnectedAccount({
         supabase,
         stripe,
-        providerId
+        userId: providerId
       });
 
       const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
