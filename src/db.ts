@@ -41,13 +41,6 @@ export interface DBBooking {
   updated_at: string;
 }
 
-export interface DBProvider {
-  provider_id: string;
-  stripe_account_id: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
 export interface DBStripeConnectedAccount {
   user_id: string;
   stripe_account_id: string;
@@ -312,43 +305,6 @@ export async function updateStripeConnectedAccountStatus(
     throw error;
   }
 
-  return data;
-}
-
-export async function getProviderStripeAccountId(
-  supabase: SupabaseClient,
-  providerId: string
-): Promise<string | null> {
-  const connectedAccount = await getStripeConnectedAccountByUserId(supabase, providerId);
-  return connectedAccount?.stripe_account_id ?? null;
-}
-
-export async function setProviderStripeAccountId(
-  supabase: SupabaseClient,
-  providerId: string,
-  stripeAccountId: string
-): Promise<DBProvider> {
-  await upsertStripeConnectedAccount(supabase, {
-    userId: providerId,
-    stripeAccountId
-  });
-
-  const { data, error } = await supabase
-    .from('providers')
-    .upsert(
-      {
-        provider_id: providerId,
-        stripe_account_id: stripeAccountId,
-        updated_at: new Date().toISOString()
-      },
-      {
-        onConflict: 'provider_id'
-      }
-    )
-    .select()
-    .single<DBProvider>();
-
-  if (error) throw error;
   return data;
 }
 

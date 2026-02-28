@@ -12,11 +12,6 @@ import { v4 as uuidv4 } from 'uuid';
 import * as db from '../db';
 import { authenticateUser } from '../middleware/auth';
 import { resolveBookingServiceDetails } from './bookingServiceResolver';
-import {
-  getOrCreateConnectedAccount,
-  getStripeAccountStatus,
-  isStripeAccountReady
-} from '../stripeConnect';
 
 const isValidUuid = (value: string): boolean =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
@@ -321,23 +316,33 @@ export function createCheckoutSessionHandler(params: {
         }
       };
 
-      // Use provider's single Stripe Connect account (destination charges)
+      // Use provider's single Stripe Connect account from stripe_connected_accounts
       let providerStripeAccountId: string | null = null;
 
       if (booking.provider_id) {
-        providerStripeAccountId = await getOrCreateConnectedAccount({
+        const connectedAccount = await db.getStripeConnectedAccountByUserId(
           supabase,
-          stripe,
-          userId: booking.provider_id
-        });
+          booking.provider_id
+        );
 
-        const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
-        if (!isStripeAccountReady(accountStatus)) {
+        if (!connectedAccount?.stripe_account_id) {
           return res.status(400).json({
             code: 'PROVIDER_PAYOUT_SETUP_REQUIRED',
             message: 'Provider must complete payout setup to accept online payments.'
           });
         }
+
+        const isReadyForPayouts =
+          !!connectedAccount.charges_enabled && !!connectedAccount.payouts_enabled;
+
+        if (!isReadyForPayouts) {
+          return res.status(400).json({
+            code: 'PROVIDER_PAYOUT_SETUP_REQUIRED',
+            message: 'Provider must complete payout setup to accept online payments.'
+          });
+        }
+
+        providerStripeAccountId = connectedAccount.stripe_account_id;
       }
 
       let applicationFeeAmount: number | null = null;
@@ -604,7 +609,6 @@ export function createBookingRoutes(
     async (req, res) => {
     try {
       const {
-        providerUserId,
         serviceId,
         serviceName,
         servicePriceCents,
@@ -614,13 +618,6 @@ export function createBookingRoutes(
       } = req.body;
 
       const customerUserId = req.user!.id;
-
-      if (!providerUserId || typeof providerUserId !== 'string' || !isValidUuid(providerUserId)) {
-        return res.status(400).json({
-          error: 'INVALID_REQUEST',
-          message: 'providerUserId must be a valid UUID'
-        });
-      }
 
       if (!serviceId || typeof serviceId !== 'string' || serviceId.trim().length === 0) {
         return res.status(400).json({
@@ -684,14 +681,20 @@ export function createBookingRoutes(
         });
       }
 
-      const { data: providerUser, error: providerUserError } = await supabase.auth.admin.getUserById(
-        providerUserId
-      );
+      const service = await db.getService(supabase, serviceId);
+      if (!service || !service.active) {
+        return res.status(404).json({
+          error: 'SERVICE_NOT_FOUND',
+          message: 'Service not found'
+        });
+      }
 
-      if (providerUserError || !providerUser?.user) {
+      const providerUserId = service.provider_id;
+
+      if (service.name !== serviceName || service.price_cents !== servicePriceCents || service.duration !== serviceDurationMinutes) {
         return res.status(400).json({
-          error: 'INVALID_PROVIDER',
-          message: 'providerUserId must reference an existing user'
+          error: 'SERVICE_DETAILS_MISMATCH',
+          message: 'Provided service fields do not match current service data'
         });
       }
 
@@ -774,23 +777,22 @@ export function createBookingRoutes(
         }
       };
 
-      const providerStripeAccountId = await getOrCreateConnectedAccount({
-        supabase,
-        stripe,
-        userId: providerUserId
-      });
+      const connectedAccount = await db.getStripeConnectedAccountByUserId(supabase, providerUserId);
+      const isReadyForPayouts =
+        !!connectedAccount?.charges_enabled && !!connectedAccount?.payouts_enabled;
 
-      const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
-      if (!isStripeAccountReady(accountStatus)) {
+      if (!connectedAccount?.stripe_account_id || !isReadyForPayouts) {
         return res.status(400).json({
           code: 'PROVIDER_PAYOUT_SETUP_REQUIRED',
           message: 'Provider must complete payout setup to accept online payments.'
         });
       }
 
+      const destinationStripeAccountId = connectedAccount.stripe_account_id;
+
       sessionParams.payment_intent_data = {
         transfer_data: {
-          destination: providerStripeAccountId
+          destination: destinationStripeAccountId
         },
         metadata: {
           type: 'booking',

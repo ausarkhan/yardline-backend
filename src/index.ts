@@ -8,9 +8,7 @@ import { authenticateUser, optionalAuth } from './middleware/auth';
 import { createBookingRoutes } from './routes/bookings';
 import { createBookingV1Routes } from './routes/bookings-v1';
 import {
-  getOrCreateConnectedAccount,
-  getStripeAccountStatus,
-  isStripeAccountReady
+  getOrCreateConnectedAccount
 } from './stripeConnect';
 
 const app = express();
@@ -1184,19 +1182,18 @@ app.post('/v1/checkout/create-session', async (req, res) => {
     // Production uses 'yardline://', dev/preview uses 'vibecode://'
     const APP_URL_SCHEME = process.env.APP_URL_SCHEME || 'yardline';
 
-    const providerStripeAccountId = await getOrCreateConnectedAccount({
-      supabase,
-      stripe,
-      userId: providerId
-    });
+    const connectedAccount = await db.getStripeConnectedAccountByUserId(supabase, providerId);
+    const isReadyForPayouts =
+      !!connectedAccount?.charges_enabled && !!connectedAccount?.payouts_enabled;
 
-    const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
-    if (!isStripeAccountReady(accountStatus)) {
+    if (!connectedAccount?.stripe_account_id || !isReadyForPayouts) {
       return res.status(400).json({
         code: 'PROVIDER_PAYOUT_SETUP_REQUIRED',
         message: 'Provider must complete payout setup to accept online payments.'
       });
     }
+
+    const providerStripeAccountId = connectedAccount.stripe_account_id;
 
     // Create Checkout Session with Model A pricing structure
     const session = await stripe.checkout.sessions.create({
@@ -1419,19 +1416,18 @@ app.post('/v1/checkout/session', async (req, res) => {
     // Production uses 'yardline://', dev/preview uses 'vibecode://'
     const APP_URL_SCHEME = process.env.APP_URL_SCHEME || 'yardline';
 
-    const providerStripeAccountId = await getOrCreateConnectedAccount({
-      supabase,
-      stripe,
-      userId: providerId
-    });
+    const connectedAccount = await db.getStripeConnectedAccountByUserId(supabase, providerId);
+    const isReadyForPayouts =
+      !!connectedAccount?.charges_enabled && !!connectedAccount?.payouts_enabled;
 
-    const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
-    if (!isStripeAccountReady(accountStatus)) {
+    if (!connectedAccount?.stripe_account_id || !isReadyForPayouts) {
       return res.status(400).json({
         code: 'PROVIDER_PAYOUT_SETUP_REQUIRED',
         message: 'Provider must complete payout setup to accept online payments.'
       });
     }
+
+    const providerStripeAccountId = connectedAccount.stripe_account_id;
 
     // Create Checkout Session with Model A pricing structure
     const session = await stripe.checkout.sessions.create({
@@ -1639,19 +1635,18 @@ app.post('/v1/payments/create-intent', async (req, res) => {
       paymentIntentParams.customer = customerId;
     }
 
-    const providerStripeAccountId = await getOrCreateConnectedAccount({
-      supabase,
-      stripe,
-      userId: providerId
-    });
+    const connectedAccount = await db.getStripeConnectedAccountByUserId(supabase, providerId);
+    const isReadyForPayouts =
+      !!connectedAccount?.charges_enabled && !!connectedAccount?.payouts_enabled;
 
-    const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
-    if (!isStripeAccountReady(accountStatus)) {
+    if (!connectedAccount?.stripe_account_id || !isReadyForPayouts) {
       return res.status(400).json({
         code: 'PROVIDER_PAYOUT_SETUP_REQUIRED',
         message: 'Provider must complete payout setup to accept online payments.'
       });
     }
+
+    const providerStripeAccountId = connectedAccount.stripe_account_id;
 
     // Configure Connect transfer (Model A)
     paymentIntentParams.transfer_data = {
@@ -1797,19 +1792,18 @@ app.post('/v1/stripe/payment-intents', async (req, res) => {
         });
       }
 
-      const providerStripeAccountId = await getOrCreateConnectedAccount({
-        supabase,
-        stripe,
-        userId: providerId
-      });
+      const connectedAccount = await db.getStripeConnectedAccountByUserId(supabase, providerId);
+      const isReadyForPayouts =
+        !!connectedAccount?.charges_enabled && !!connectedAccount?.payouts_enabled;
 
-      const accountStatus = await getStripeAccountStatus(stripe, providerStripeAccountId);
-      if (!isStripeAccountReady(accountStatus)) {
+      if (!connectedAccount?.stripe_account_id || !isReadyForPayouts) {
         return res.status(400).json({
           code: 'PROVIDER_PAYOUT_SETUP_REQUIRED',
           message: 'Provider must complete payout setup to accept online payments.'
         });
       }
+
+      const providerStripeAccountId = connectedAccount.stripe_account_id;
 
       paymentIntentParams.transfer_data = { destination: providerStripeAccountId };
       paymentIntentParams.application_fee_amount = ticketSubtotalCents;

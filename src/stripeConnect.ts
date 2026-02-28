@@ -160,29 +160,11 @@ export async function getOrCreateConnectedAccount(params: {
     detailsSubmitted: !!account.details_submitted
   });
 
-  await db.setProviderStripeAccountId(supabase, userId, account.id);
-
   console.log(
     `[STRIPE_CONNECT] userId=${userId} stripeAccountId=${account.id} created`
   );
 
   return account.id;
-}
-
-export async function getOrCreateProviderStripeAccountId(params: {
-  supabase: SupabaseClient;
-  stripe: Stripe;
-  providerId: string;
-  email?: string | null;
-  name?: string | null;
-}): Promise<string> {
-  return getOrCreateConnectedAccount({
-    supabase: params.supabase,
-    stripe: params.stripe,
-    userId: params.providerId,
-    userEmail: params.email,
-    displayName: params.name
-  });
 }
 
 export async function getStripeAccountStatus(
